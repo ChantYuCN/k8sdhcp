@@ -1,0 +1,5 @@
+
+dnsmasq:
+  ip: 182.168.0.100
+  image: localdhcp
+  tag: v1

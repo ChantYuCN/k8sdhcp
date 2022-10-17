@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment                                          
+metadata:
+  name: dnsmasq
+spec:
+  replicas: 1
+  minReadySeconds: 15
+  strategy:
+    type: RollingUpdate                                   
+    rollingUpdate: 
+      maxUnavailable: 1                                   
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: dnsmasq
+  template:                                               
+    metadata:
+      labels:
+        app: dnsmasq
+    spec:
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      containers:
+      - image: '{{ .Values.dnsmasq.image }}:{{ .Values.dnsmasq.tag }}'
+          imagePullPolicy: IfNotPresent
+          name: dnsmasq
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 0
+          ports:
+            - containerPort: 53
+          volumeMounts:
+          - mountPath: /etc/dnsmasq.conf
+            subPath: dnsmasq.conf
+            name: dnsmasq-conf
+          - mountPath: /etc/hosts
+            subPath: hosts
+            name: dnsmasq-hosts
+          - mountPath: /etc/resolv.conf
+            subPath: resolv.conf
+            name: dnsmasq-resolvconf
+          securityContext:
+            allowPrivilegeEscalation: false
+      hostNetwork: true
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+          - 182.168.0.100
+      volumes:
+      - name: dnsmasq-conf
+        configMap:
+          name: dnsmasq-conf
+      - name: dnsmasq-hosts
+        configMap:
+          name: dnsmasq-hosts
+      - name: dnsmasq-resolvconf
+        configMap:
+          name: dnsmasq-resolvconf

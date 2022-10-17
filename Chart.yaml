@@ -1,0 +1,7 @@
+apiVersion: v2
+appVersion: v0.11.1
+description: 'chant test'
+name: dhcpserver 
+type: application
+version: 0.1.0
+
