@@ -1,5 +1,5 @@
 apiVersion: apps/v1
-kind: Deployment                                          
+kind: Deployment 
 metadata:
   name: dnsmasq
 spec:
@@ -22,26 +22,26 @@ spec:
         runAsUser: 0
         runAsGroup: 0
       containers:
-      - image: '{{ .Values.dnsmasq.image }}:{{ .Values.dnsmasq.tag }}'
-          imagePullPolicy: IfNotPresent
-          name: dnsmasq
-          securityContext:
-            allowPrivilegeEscalation: false
-            runAsUser: 0
-          ports:
-            - containerPort: 53
-          volumeMounts:
-          - mountPath: /etc/dnsmasq.conf
-            subPath: dnsmasq.conf
-            name: dnsmasq-conf
-          - mountPath: /etc/hosts
-            subPath: hosts
-            name: dnsmasq-hosts
-          - mountPath: /etc/resolv.conf
-            subPath: resolv.conf
-            name: dnsmasq-resolvconf
-          securityContext:
-            allowPrivilegeEscalation: false
+      - image: localdhcp:v1
+        imagePullPolicy: IfNotPresent
+        name: dnsmasq
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsUser: 0
+        ports:
+          - containerPort: 53
+        volumeMounts:
+        - mountPath: /etc/dnsmasq.conf
+          subPath: dnsmasq.conf
+          name: dnsmasq-conf
+        - mountPath: /etc/hosts
+          subPath: hosts
+          name: dnsmasq-hosts
+        - mountPath: /etc/resolv.conf
+          subPath: resolv.conf
+          name: dnsmasq-resolvconf
+        securityContext:
+          allowPrivilegeEscalation: false
       hostNetwork: true
       dnsPolicy: "None"
       dnsConfig:
