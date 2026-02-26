@@ -13,3 +13,8 @@ $ docker build . -t localdhcp:v1 --build-arg HTTP_PROXY=$http_proxy --build-arg 
 $ helm install dhcp ./dnsmasq -n dhcp --create-namespace
 ```
 
+
+```console
+# A simple script to install deb package on ubuntu to provide dhpc service
+bash linuxshell.sh 
+```
