@@ -20,6 +20,7 @@ dhcp-option=3,192.168.5.1
 dhcp-option=6,192.168.5.1
 EOF
 
+ip link add 192.168.5.1/24 dev eth0
 sudo systemctl restart dnsmasq
 sudo systemctl enable dnsmasq
 
