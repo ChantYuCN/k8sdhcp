@@ -29,10 +29,9 @@ sudo systemctl enable dnsmasq
 
 # sudo nano /etc/netplan/01-netcfg.yaml
 # network:
-# version: 2
-# renderer: networkd
-# ethernets:
-#   enp0s3:
-#     dhcp4: true
+#   version: 2
+#   ethernets:
+#     enp0s3:
+#       dhcp4: true
 
 # sudo netplan apply
