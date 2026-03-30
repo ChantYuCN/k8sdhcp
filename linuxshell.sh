@@ -35,3 +35,46 @@ sudo systemctl enable dnsmasq
 #       dhcp4: true
 
 # sudo netplan apply
+
+
+#sudo apt install tftp-hpa  tftpd-hpa -y
+sudo apt install dnsmasq -y
+
+cat <<EOF>/etc/dnsmasq.conf
+enable-tftp
+tftp-root=/var/lib/tftpboot/
+#Optional: Secure mode (only serve files owned by dnsmasq user)
+#tftp-secure
+#dhcp-boot=pxelinux.0,pxeserver,192.168.6.100
+dhcp-boot=bootx64.efi
+pxe-prompt="Press SPACE to boot from network or 'e' to exit",3
+pxe-service=x86PC,"Boot from network",pxelinux
+EOF
+
+wget https://old-releases.ubuntu.com/releases/plucky/ubuntu-25.04-netboot-amd64.tar.gz
+sudo mkdir -p /var/lib/tftpboot/
+tar -zxvf ubuntu-25.04-netboot-amd64.tar.gz 
+cp -r amd64/* /var/lib/tftpboot/
+sudo sed -i "s#https://releases.ubuntu.com/25.04#http://192.168.6.1/iso#g" /var/lib/tftpboot/grub/grub.cfg
+sudo chmod -R 777  /var/lib/tftpboot/
+
+
+sudo systemctl restart dnsmasq
+#sudo systemctl restart tftp-hpa
+
+sudo apt install apache2 -y
+sudo mkdir -p /var/www/html/iso
+
+wget https://old-releases.ubuntu.com/releases/plucky/ubuntu-25.04-beta-live-server-amd64.iso 
+sudo cp ubuntu-25.04-beta-live-server-amd64.iso  /var/www/html/iso
+sudo chmod -R 777 /var/www/html/iso
+
+cat /etc/apache2/sites-enabled/000-default.conf
+...
+   DocumentRoot /var/www/html/iso
+...
+
+sudo systemctl daemon-reload
+sudo systemctl restart apache2
+
+## Lite PXE server is ready
