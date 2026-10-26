@@ -3,7 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::{is_mac, normalize_mac, Config};
-use crate::util::{now_iso, probe, run_soft, Ctx};
+use crate::render;
+use crate::util::{mkdir, now_iso, probe, run, run_soft, write_file, Ctx};
 
 const LEASES: &str = "/var/lib/misc/dnsmasq.leases";
 
@@ -18,6 +19,23 @@ fn need_mac(arg: Option<&String>) -> Result<String, String> {
 
 fn is_ip(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+/// Make the TFTP tree root-owned and read-only (no 777), except the marker dir the CGI (www-data) writes.
+pub fn fix_perms(c: &Config, ctx: Ctx) -> Result<(), String> {
+    let done = c.done_dir();
+    mkdir(ctx, &done)?;
+    let root = c.tftp_root.as_str();
+    run(ctx, "find", &[root, "-path", &done, "-prune", "-o", "-exec", "chown", "root:root", "{}", "+"])?;
+    run(ctx, "find", &[root, "-path", &done, "-prune", "-o", "-type", "d", "-exec", "chmod", "755", "{}", "+"])?;
+    run(ctx, "find", &[root, "-path", &done, "-prune", "-o", "-type", "f", "-exec", "chmod", "644", "{}", "+"])?;
+    run(ctx, "chown", &["www-data:www-data", &done])
+}
+
+/// Write our grub.cfg (it replaces the one shipped in the netboot tarball) and fix permissions.
+pub fn write_grub(c: &Config, ctx: Ctx) -> Result<(), String> {
+    write_file(ctx, &format!("{}/grub/grub.cfg", c.tftp_root), &render::grub_cfg(c), 0o644, false)?;
+    fix_perms(c, ctx)
 }
 
 /// Create the "installed" marker for a MAC (grub.cfg skips PXE install for it).
@@ -183,6 +201,12 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             println!("marked {mac} as installed");
             Ok(())
         }
+        Some("grub") => {
+            // run after copying netboot files into the TFTP root (the tarball ships its own grub.cfg)
+            write_grub(&c, Ctx { dry: false })?;
+            println!("wrote {}/grub/grub.cfg and fixed permissions", c.tftp_root);
+            Ok(())
+        }
         Some("binds") => {
             for l in read_hosts(&c) {
                 println!("{l}");
@@ -196,7 +220,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | grub | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 

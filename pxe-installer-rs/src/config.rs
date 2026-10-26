@@ -25,8 +25,7 @@ pub struct Config {
     pub target_hostname: String,
     pub target_user: String,
     pub target_password: String,
-    pub release_url: String,
-    pub netboot_tar: String,
+    /// File name of the live-server ISO the admin places in <web_root>/iso/ (used in grub.cfg)
     pub iso_name: String,
     pub tftp_root: String,
     pub web_root: String,
@@ -50,8 +49,6 @@ impl Default for Config {
             target_hostname: "ubuntu-node".into(),
             target_user: "ubuntu".into(),
             target_password: String::new(),
-            release_url: "https://old-releases.ubuntu.com/releases/plucky".into(),
-            netboot_tar: "ubuntu-25.04-netboot-amd64.tar.gz".into(),
             iso_name: "ubuntu-25.04-beta-live-server-amd64.iso".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
@@ -149,9 +146,9 @@ impl Config {
             "TARGET_PASSWORD" => {
                 self.target_password = val.trim_end_matches(|c| c == '\r' || c == '\n').into()
             }
-            "RELEASE_URL" => self.release_url = v.trim_end_matches('/').into(),
-            "NETBOOT_TAR" => self.netboot_tar = v.into(),
             "ISO_NAME" => self.iso_name = v.into(),
+            // settings from older versions that downloaded files: accepted and ignored
+            "RELEASE_URL" | "NETBOOT_TAR" | "ISO_FILE" => {}
             "TFTP_ROOT" => self.tftp_root = v.trim_end_matches('/').into(),
             "WEB_ROOT" => self.web_root = v.trim_end_matches('/').into(),
             "HOSTS_FILE" => self.hosts_file = v.into(),
@@ -282,12 +279,6 @@ impl Config {
                     .to_string(),
             );
         }
-        if !(self.release_url.starts_with("http://") || self.release_url.starts_with("https://")) {
-            errs.push("RELEASE_URL must start with http:// or https://".to_string());
-        }
-        if !self.netboot_tar.ends_with(".tar.gz") || self.netboot_tar.contains('/') {
-            errs.push("NETBOOT_TAR must be a plain .tar.gz file name".to_string());
-        }
         if !self.iso_name.ends_with(".iso") || self.iso_name.contains('/') {
             errs.push("ISO_NAME must be a plain .iso file name".to_string());
         }
@@ -333,40 +324,35 @@ impl Config {
 
     /// KEY=VALUE text accepted by `load_file` (used by the GUI to hand settings to `install`).
     pub fn to_conf(&self) -> String {
-        let b = |v: bool| if v { 1 } else { 0 };
-        let mut s = format!(
-            "IFACE={}
-SERVER_IP={}
-PREFIX={}
-DHCP_START={}
-DHCP_END={}
-LEASE={}
-UPSTREAM_DNS={}
-             SET_STATIC_IP={}
-ONLY_KNOWN_HOSTS={}
-TARGET_HOSTNAME={}
-TARGET_USER={}
-TARGET_PASSWORD={}
-             RELEASE_URL={}
-NETBOOT_TAR={}
-ISO_NAME={}
-",
-            self.iface, self.server_ip, self.prefix, self.dhcp_start, self.dhcp_end, self.lease,
-            self.upstream_dns, b(self.set_static_ip), b(self.only_known_hosts), self.target_hostname,
-            self.target_user, self.target_password, self.release_url, self.netboot_tar, self.iso_name
-        );
+        let flag = |v: bool| if v { "1" } else { "0" };
+        let mut lines: Vec<String> = vec![
+            format!("IFACE={}", self.iface),
+            format!("SERVER_IP={}", self.server_ip),
+            format!("PREFIX={}", self.prefix),
+            format!("DHCP_START={}", self.dhcp_start),
+            format!("DHCP_END={}", self.dhcp_end),
+            format!("LEASE={}", self.lease),
+            format!("UPSTREAM_DNS={}", self.upstream_dns),
+            format!("SET_STATIC_IP={}", flag(self.set_static_ip)),
+            format!("ONLY_KNOWN_HOSTS={}", flag(self.only_known_hosts)),
+            format!("TARGET_HOSTNAME={}", self.target_hostname),
+            format!("TARGET_USER={}", self.target_user),
+            format!("TARGET_PASSWORD={}", self.target_password),
+            format!("ISO_NAME={}", self.iso_name),
+        ];
         for h in &self.bindings {
-            s.push_str(&format!("HOST={},{},{}
-", h.mac, h.ip, h.hostname));
+            lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
         }
-        s
+        lines.join("
+") + "
+"
     }
 
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\n",
-            self.tftp_root, self.web_root, self.hosts_file, self.server_ip, self.prefix
+            "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\n",
+            self.tftp_root, self.web_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name
         )
     }
 
@@ -391,6 +377,14 @@ mod tests {
     #[test]
     fn defaults_valid() {
         assert!(good().validate().is_empty(), "{:?}", good().validate());
+    }
+
+    #[test]
+    fn iso_name_checked() {
+        let mut c = good();
+        c.iso_name = "dir/x.iso".into();
+        assert!(c.validate().iter().any(|e| e.contains("ISO_NAME")));
+        assert!(good().set("RELEASE_URL", "http://x").is_ok()); // ignored, not an error
     }
 
     #[test]

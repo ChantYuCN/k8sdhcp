@@ -22,6 +22,18 @@ It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pkexec pxe-installer install --config ...` and streams the output with a progress bar; the temp file is
 deleted afterwards. Manage tab: host status, installed hosts, bindings, reinstall / mark installed / bind / unbind.
 
+## What it does NOT do: netboot image and ISO
+`install` only installs/enables **dnsmasq** and **Apache** and writes their configuration. It never downloads
+or copies the Ubuntu files - you place them yourself afterwards:
+```
+# 1. netboot files (extract the Ubuntu netboot tarball's amd64/* content) into the TFTP root
+sudo cp -r amd64/* /var/lib/tftpboot/
+sudo pxe-ctl grub                      # re-apply our grub.cfg (the tarball ships its own) + permissions
+# 2. the live-server ISO, named as ISO_NAME in the config
+sudo cp ubuntu-25.04-live-server-amd64.iso /var/www/html/iso/
+```
+`install` finishes by printing these next steps and noting which files are still missing.
+
 ## Use
 ```
 pxe-installer print-config > pxe.conf       # edit it (set TARGET_PASSWORD!)
@@ -51,7 +63,7 @@ src/lib.rs       shared library (used by both binaries)
 src/gui.rs      GTK 4 app (feature `gui`)
 src/config.rs   settings, config-file/flag parsing, validation
 src/render.rs   templates for dnsmasq.conf, grub.cfg, user-data, netplan, apache conf
-src/install.rs  the install steps (honours --dry-run)
+src/install.rs  the install steps: packages, dnsmasq, Apache, services (honours --dry-run)
 src/ctl.rs      pxe-ctl commands, status, CGI callback
 src/util.rs     command/file helpers
 ```

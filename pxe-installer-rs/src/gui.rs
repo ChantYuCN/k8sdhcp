@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Number of "==> " step markers a full install prints.
-const TOTAL_STEPS: f64 = 9.0;
+const TOTAL_STEPS: f64 = 8.0;
 
 enum Msg {
     Line(String),
@@ -189,8 +189,6 @@ struct Form {
     t_user: gtk::Entry,
     t_pw: gtk::Entry,
     t_pw2: gtk::Entry,
-    release_url: gtk::Entry,
-    netboot: gtk::Entry,
     iso: gtk::Entry,
     hosts: gtk::TextView,
 }
@@ -213,8 +211,6 @@ impl Form {
         c.target_hostname = text_of(&self.t_host).trim().to_string();
         c.target_user = text_of(&self.t_user).trim().to_string();
         c.target_password = text_of(&self.t_pw);
-        c.release_url = text_of(&self.release_url).trim().trim_end_matches('/').to_string();
-        c.netboot_tar = text_of(&self.netboot).trim().to_string();
         c.iso_name = text_of(&self.iso).trim().to_string();
 
         let buf = self.hosts.buffer();
@@ -266,23 +262,20 @@ fn install_tab() -> gtk::Widget {
     let t_user = entry(&d.target_user);
     let t_pw = secret("");
     let t_pw2 = secret("");
-    let release_url = entry(&d.release_url);
-    let netboot = entry(&d.netboot_tar);
     let iso = entry(&d.iso_name);
     grid_row(&tgt, 0, "Target hostname", &t_host);
     grid_row(&tgt, 1, "Target username", &t_user);
     grid_row(&tgt, 2, "Target password", &t_pw);
     grid_row(&tgt, 3, "Repeat password", &t_pw2);
-    grid_row(&tgt, 4, "Release URL", &release_url);
-    grid_row(&tgt, 5, "Netboot tarball", &netboot);
-    grid_row(&tgt, 6, "Live-server ISO", &iso);
+    iso.set_tooltip_text(Some("Name of the ISO you copy into /var/www/html/iso/ yourself"));
+    grid_row(&tgt, 4, "Live-server ISO file name", &iso);
     let warn = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
         .use_markup(true)
         .label("<b>Warning:</b> hosts that PXE boot are <b>wiped</b> and reinstalled unless already installed (or marked done).")
         .build();
-    tgt.attach(&warn, 0, 7, 2, 1);
+    tgt.attach(&warn, 0, 5, 2, 1);
 
     let hosts = gtk::TextView::builder().monospace(true).build();
     hosts.buffer().set_text("# one binding per line:  mac,ip[,hostname]\n# aa:bb:cc:dd:ee:01,192.168.5.11,node01\n");
@@ -314,7 +307,7 @@ fn install_tab() -> gtk::Widget {
 
     let form = Form {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
-        t_host, t_user, t_pw, t_pw2, release_url, netboot, iso, hosts,
+        t_host, t_user, t_pw, t_pw2, iso, hosts,
     };
 
     install_btn.connect_clicked(move |btn| {

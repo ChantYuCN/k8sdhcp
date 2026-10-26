@@ -9,7 +9,7 @@ pxe-installer - UEFI PXE server installer (dnsmasq + Apache)
 
 USAGE
   pxe-installer install [--config FILE] [--dry-run] [options]
-  pxe-installer ctl list | status | reinstall <mac> | done <mac>
+  pxe-installer ctl list | status | grub | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done                (internal) Apache callback
@@ -17,7 +17,7 @@ USAGE
 INSTALL OPTIONS  (flags override --config; same names as config keys)
   --iface NAME  --server-ip IP  --prefix N  --dhcp-start IP  --dhcp-end IP
   --lease 24h  --upstream-dns IP  --static-ip  --only-known-hosts
-  --target-hostname H  --target-user U  --release-url URL  --netboot-tar F  --iso-name F
+  --target-hostname H  --target-user U  --iso-name FILE.iso   (ISO file name you place in <web-root>/iso/)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
 
@@ -41,8 +41,7 @@ TARGET_HOSTNAME=ubuntu-node
 TARGET_USER=ubuntu
 TARGET_PASSWORD=ChangeMe-please
 
-RELEASE_URL=https://old-releases.ubuntu.com/releases/plucky
-NETBOOT_TAR=ubuntu-25.04-netboot-amd64.tar.gz
+# the ISO file name you will copy into /var/www/html/iso/ (the installer does not download or copy it)
 ISO_NAME=ubuntu-25.04-beta-live-server-amd64.iso
 
 # fixed MAC -> IP bindings (repeat HOST=)

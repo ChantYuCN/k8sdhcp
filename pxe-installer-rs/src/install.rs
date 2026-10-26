@@ -1,4 +1,5 @@
-//! The `install` command: turns a plain Ubuntu host into a UEFI PXE server.
+//! The `install` command: installs and enables dnsmasq + Apache and writes their PXE configuration.
+//! It does NOT download or copy the netboot image or the ISO - the admin places those manually.
 use std::fs;
 use std::path::Path;
 
@@ -20,16 +21,16 @@ pub fn install(c: &Config) -> Result<(), String> {
         println!("[dry-run] nothing will be changed; showing what would be done");
     }
 
-    let workdir = if ctx.dry { "/tmp/pxe-installer-XXXXXX".to_string() } else { output("mktemp", &["-d"])? };
-    let result = steps(c, ctx, &workdir);
-    if !ctx.dry {
-        let _ = fs::remove_dir_all(&workdir);
-    }
-    result?;
+    steps(c, ctx)?;
 
     println!(
-        "\nPXE server ready.\n  DHCP/TFTP : {} ({}-{})\n  HTTP ISO  : http://{}/iso/{}\n\
-         Boot the target host in UEFI mode with \"PXE IPv4\" as first boot device.\n\n\
+        "\nPXE services are installed and running ({} / {}-{}).\n\n\
+         NEXT STEPS (manual - this installer does not download or copy these files):\n\
+         \x20 1. Netboot files (bootx64.efi, grubx64.efi, casper/vmlinuz, casper/initrd, ...)\n\
+         \x20      -> copy into {}/\n\
+         \x20    then run:  sudo pxe-ctl grub     (re-applies our grub.cfg and file permissions)\n\
+         \x20 2. Live-server ISO  -> {}/iso/{}\n\n\
+         Then boot the target host in UEFI mode with \"PXE IPv4\" as first boot device.\n\
          Duplicate-install guard: installed hosts are recorded in {}/<mac>\n\
          \x20 sudo pxe-ctl status | list | reinstall <mac> | done <mac>\n\
          \x20 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>\n\
@@ -37,22 +38,22 @@ pub fn install(c: &Config) -> Result<(), String> {
         c.server_ip,
         c.dhcp_start,
         c.dhcp_end,
-        c.server_ip,
+        c.tftp_root,
+        c.web_root,
         c.iso_name,
         c.done_dir()
     );
     Ok(())
 }
 
-fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
+fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
     let iso_dir = format!("{}/iso", c.web_root);
     let ai_dir = format!("{}/autoinstall", c.web_root);
-    let iso_path = format!("{iso_dir}/{}", c.iso_name);
 
     // ---- 1. packages ----
     step("Installing packages");
     run(ctx, "apt-get", &["update", "-y"])?;
-    run(ctx, "apt-get", &["install", "-y", "dnsmasq", "apache2", "wget", "curl", "openssl"])?;
+    run(ctx, "apt-get", &["install", "-y", "dnsmasq", "apache2", "curl", "openssl"])?;
 
     // ---- 2. server network (optional) ----
     if c.set_static_ip {
@@ -101,21 +102,10 @@ fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
     }
     run(ctx, "dnsmasq", &["--test"])?;
 
-    // ---- 5. netboot files + grub.cfg with the duplicate-install guard ----
-    step("Fetching netboot image");
-    mkdir(ctx, &c.tftp_root)?;
-    let tar_path = format!("{workdir}/{}", c.netboot_tar);
-    run(ctx, "wget", &["-nv", "-O", &tar_path, &format!("{}/{}", c.release_url, c.netboot_tar)])?;
-    run(ctx, "tar", &["-xzf", &tar_path, "-C", workdir])?;
-    run(ctx, "cp", &["-r", &format!("{workdir}/amd64/."), &format!("{}/", c.tftp_root)])?;
-
+    // ---- 5. TFTP root skeleton: grub.cfg with the duplicate-install guard + marker dir ----
     step("Writing grub.cfg (duplicate-install guard)");
-    write_file(ctx, &format!("{}/grub/grub.cfg", c.tftp_root), &render::grub_cfg(c), 0o644, false)?;
-    mkdir(ctx, &c.done_dir())?;
-    // root-owned and read-only (no 777), except the marker dir which the CGI (www-data) writes
-    run(ctx, "chown", &["-R", "root:root", &c.tftp_root])?;
-    run(ctx, "chmod", &["-R", "u=rwX,go=rX", &c.tftp_root])?;
-    run(ctx, "chown", &["www-data:www-data", &c.done_dir()])?;
+    mkdir(ctx, &c.tftp_root)?;
+    ctl::write_grub(c, ctx)?;
 
     // ---- 6. helper commands (this binary copies itself so cgi/ctl keep working) ----
     step("Installing helper commands");
@@ -131,16 +121,12 @@ fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
     write_file(ctx, CTL_WRAPPER_PATH, &render::ctl_wrapper(), 0o755, false)?;
     write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
 
-    // ---- 7. Apache: ISO, autoinstall files, "done" callback ----
+    // ---- 7. Apache: web dirs, autoinstall files, "done" callback ----
     step("Configuring Apache");
     mkdir(ctx, &iso_dir)?;
     mkdir(ctx, &ai_dir)?;
-    if ctx.dry || !Path::new(&iso_path).exists() {
-        run(ctx, "wget", &["-nv", "-c", "-O", &iso_path, &format!("{}/{}", c.release_url, c.iso_name)])?;
-    }
     set_mode_soft(ctx, &iso_dir, 0o755);
     set_mode_soft(ctx, &ai_dir, 0o755);
-    set_mode_soft(ctx, &iso_path, 0o644);
 
     let pw_hash = if ctx.dry {
         "$6$dryrun$hash".to_string()
@@ -154,7 +140,7 @@ fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
     run(ctx, "a2enmod", &["cgi"])?;
     run(ctx, "a2enconf", &["serve-cgi-bin", "pxe-done"])?;
 
-    // ---- 8. services ----
+    // ---- 8. enable + start services ----
     step("Starting services");
     run(ctx, "systemctl", &["enable", "apache2", "dnsmasq"])?;
     run(ctx, "systemctl", &["restart", "apache2", "dnsmasq"])?;
@@ -177,9 +163,6 @@ fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
             println!("{svc}: {}", if ctl::service_active(svc) { "active" } else { "NOT ACTIVE" });
         }
         let base = format!("http://{}", c.server_ip);
-        if !probe("curl", &["-sfI", &format!("{base}/iso/{}", c.iso_name)]) {
-            warn("ISO not reachable over HTTP");
-        }
         if !probe("curl", &["-sf", &format!("{base}/autoinstall/user-data")]) {
             warn("autoinstall user-data not reachable");
         }
@@ -187,8 +170,12 @@ fn steps(c: &Config, ctx: Ctx, workdir: &str) -> Result<(), String> {
         if !cgi.contains("bad mac") {
             warn("pxe-done CGI not working");
         }
+        // not errors: the admin copies these by hand after the install
         if !Path::new(&format!("{}/bootx64.efi", c.tftp_root)).exists() {
-            warn(&format!("{}/bootx64.efi missing", c.tftp_root));
+            println!("note: {}/bootx64.efi not present yet (copy the netboot files)", c.tftp_root);
+        }
+        if !Path::new(&format!("{iso_dir}/{}", c.iso_name)).exists() {
+            println!("note: {iso_dir}/{} not present yet (copy the ISO)", c.iso_name);
         }
     }
     Ok(())
