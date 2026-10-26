@@ -289,6 +289,9 @@ fn install_tab() -> gtk::Widget {
 
     let install_btn = gtk::Button::with_label("Install PXE server");
     install_btn.add_css_class("suggested-action");
+    let stop_btn = gtk::Button::with_label("Stop PXE server");
+    stop_btn.add_css_class("destructive-action");
+    stop_btn.set_tooltip_text(Some("Stops dnsmasq (DHCP/TFTP) and Apache so no host can PXE boot"));
     let progress = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
     let step_label = gtk::Label::builder().label("Ready.").xalign(0.0).build();
     let (log, log_sw) = log_view();
@@ -296,6 +299,7 @@ fn install_tab() -> gtk::Widget {
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.append(&install_btn);
+    row.append(&stop_btn);
     row.append(&progress);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -309,6 +313,15 @@ fn install_tab() -> gtk::Widget {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
         t_host, t_user, t_pw, t_pw2, iso, hosts,
     };
+
+    {
+        let (log, step_label) = (log.clone(), step_label.clone());
+        stop_btn.connect_clicked(move |_| {
+            log.buffer().set_text("");
+            step_label.set_text("Stopping PXE server (dnsmasq + Apache)...");
+            run_ctl(vec!["stop".to_string()], &log);
+        });
+    }
 
     install_btn.connect_clicked(move |btn| {
         let cfg = match form.collect() {

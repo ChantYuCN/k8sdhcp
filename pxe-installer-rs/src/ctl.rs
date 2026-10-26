@@ -201,6 +201,15 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             println!("marked {mac} as installed");
             Ok(())
         }
+        Some("stop") => {
+            // stop the PXE services (DHCP/TFTP + HTTP); they stay enabled and come back on reboot
+            run(Ctx { dry: false }, "systemctl", &["stop", "dnsmasq", "apache2"])?;
+            for svc in ["dnsmasq", "apache2"] {
+                println!("{svc}: {}", if service_active(svc) { "STILL ACTIVE" } else { "stopped" });
+            }
+            println!("PXE server stopped. Start it again with the Install button or: sudo systemctl start dnsmasq apache2");
+            Ok(())
+        }
         Some("grub") => {
             // run after copying netboot files into the TFTP root (the tarball ships its own grub.cfg)
             write_grub(&c, Ctx { dry: false })?;
@@ -220,7 +229,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | grub | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 

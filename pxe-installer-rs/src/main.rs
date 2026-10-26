@@ -9,7 +9,7 @@ pxe-installer - UEFI PXE server installer (dnsmasq + Apache)
 
 USAGE
   pxe-installer install [--config FILE] [--dry-run] [options]
-  pxe-installer ctl list | status | grub | reinstall <mac> | done <mac>
+  pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done                (internal) Apache callback
