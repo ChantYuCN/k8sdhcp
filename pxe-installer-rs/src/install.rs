@@ -21,6 +21,10 @@ pub fn install(c: &Config) -> Result<(), String> {
         println!("[dry-run] nothing will be changed; showing what would be done");
     }
 
+    if c.only_known_hosts && c.bindings.is_empty() {
+        warn("ONLY_KNOWN_HOSTS is on but no bindings were given: no host will get an address until you bind MACs (Manage tab / pxe-ctl bind)");
+    }
+
     steps(c, ctx)?;
 
     println!(

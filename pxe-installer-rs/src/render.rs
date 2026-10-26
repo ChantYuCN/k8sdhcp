@@ -14,8 +14,8 @@ dhcp-option=option:router,@SERVER_IP@
 dhcp-option=option:dns-server,@SERVER_IP@
 dhcp-authoritative
 
-# --- static MAC->IP bindings (re-read on SIGHUP, no restart needed) ---
-dhcp-hostsfile=@HOSTS_FILE@
+# --- static MAC->IP bindings: dhcp-host=mac,ip[,name] lines (pxe-ctl bind restarts dnsmasq) ---
+conf-file=@HOSTS_FILE@
 @ONLY_KNOWN@
 # --- DNS (forward to upstream) ---
 server=@UPSTREAM_DNS@
@@ -166,7 +166,7 @@ mod tests {
         let s = dnsmasq_conf(&cfg());
         assert!(s.contains("dhcp-range=192.168.5.100,192.168.5.200,255.255.255.0,24h"));
         assert!(s.contains("dhcp-boot=tag:efi64,bootx64.efi,192.168.5.1,192.168.5.1"));
-        assert!(s.contains("dhcp-hostsfile=/etc/dnsmasq.d/pxe-hosts"));
+        assert!(s.contains("conf-file=/etc/dnsmasq.d/pxe-hosts.conf"));
         assert!(!s.contains("dhcp-ignore"));
         assert!(!s.contains('@'));
     }

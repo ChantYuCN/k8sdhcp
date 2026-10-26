@@ -190,7 +190,6 @@ struct Form {
     t_pw: gtk::Entry,
     t_pw2: gtk::Entry,
     iso: gtk::Entry,
-    hosts: gtk::TextView,
 }
 
 impl Form {
@@ -213,15 +212,6 @@ impl Form {
         c.target_password = text_of(&self.t_pw);
         c.iso_name = text_of(&self.iso).trim().to_string();
 
-        let buf = self.hosts.buffer();
-        let all = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
-        for line in all.lines() {
-            let l = line.trim();
-            if l.is_empty() || l.starts_with('#') {
-                continue;
-            }
-            c.set("HOST", l)?;
-        }
         let errs = c.validate();
         if !errs.is_empty() {
             return Err(format!("Please fix:\n  - {}", errs.join("\n  - ")));
@@ -246,7 +236,7 @@ fn install_tab() -> gtk::Widget {
     let lease = entry(&d.lease);
     let dns = entry(&d.upstream_dns);
     let static_ip = gtk::CheckButton::with_label("Configure this static IP on the interface (netplan) - not over SSH on that NIC");
-    let only_known = gtk::CheckButton::with_label("Only serve hosts listed in the MAC bindings (ignore unknown hosts)");
+    let only_known = gtk::CheckButton::with_label("Only serve hosts bound on the Manage tab (ignore unknown hosts)");
     grid_row(&net, 0, "Interface (facing targets)", &iface);
     grid_row(&net, 1, "Server IP", &server_ip);
     grid_row(&net, 2, "Prefix length", &prefix);
@@ -277,14 +267,9 @@ fn install_tab() -> gtk::Widget {
         .build();
     tgt.attach(&warn, 0, 5, 2, 1);
 
-    let hosts = gtk::TextView::builder().monospace(true).build();
-    hosts.buffer().set_text("# one binding per line:  mac,ip[,hostname]\n# aa:bb:cc:dd:ee:01,192.168.5.11,node01\n");
-    let hosts_sw = gtk::ScrolledWindow::builder().child(&hosts).min_content_height(110).build();
-
     let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     body.append(&framed("Network / DHCP", &net));
     body.append(&framed("Target OS (autoinstall)", &tgt));
-    body.append(&framed("MAC -> IP bindings", &hosts_sw));
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
@@ -311,7 +296,7 @@ fn install_tab() -> gtk::Widget {
 
     let form = Form {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
-        t_host, t_user, t_pw, t_pw2, iso, hosts,
+        t_host, t_user, t_pw, t_pw2, iso,
     };
 
     {

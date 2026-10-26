@@ -52,7 +52,7 @@ impl Default for Config {
             iso_name: "ubuntu-25.04-beta-live-server-amd64.iso".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
-            hosts_file: "/etc/dnsmasq.d/pxe-hosts".into(),
+            hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
             bindings: Vec::new(),
             dry_run: false,
         }
@@ -315,9 +315,6 @@ impl Config {
             if !b.hostname.is_empty() && !is_hostname(&b.hostname) {
                 errs.push(format!("HOST {}: invalid hostname '{}'", b.mac, b.hostname));
             }
-        }
-        if self.only_known_hosts && self.bindings.is_empty() {
-            errs.push("ONLY_KNOWN_HOSTS needs at least one HOST binding".to_string());
         }
         errs
     }

@@ -46,16 +46,28 @@ pub fn mark_done(c: &Config, mac: &str) -> Result<(), String> {
     fs::write(&path, format!("{}\n", now_iso())).map_err(|e| format!("write {path}: {e}"))
 }
 
+/// Prefix of every binding line in the hosts file (it is loaded with `conf-file=`).
+const HOST_PREFIX: &str = "dhcp-host=";
+
+/// Bindings as "mac,ip[,name]" (prefix stripped; comments/blank lines skipped; old unprefixed lines accepted).
 fn read_hosts(c: &Config) -> Vec<String> {
     fs::read_to_string(&c.hosts_file)
-        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(|l| l.to_string()).collect())
+        .map(|t| {
+            t.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.strip_prefix(HOST_PREFIX).unwrap_or(l).to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn write_hosts(c: &Config, lines: &[String]) -> Result<(), String> {
     let tmp = format!("{}.tmp", c.hosts_file);
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
+    let mut body = String::from("# managed by pxe-installer (pxe-ctl bind / unbind) - dnsmasq dhcp-host entries\n");
+    for l in lines {
+        body.push_str(HOST_PREFIX);
+        body.push_str(l);
         body.push('\n');
     }
     if let Some(parent) = Path::new(&c.hosts_file).parent() {
@@ -66,8 +78,9 @@ fn write_hosts(c: &Config, lines: &[String]) -> Result<(), String> {
 }
 
 fn reload_dnsmasq() {
-    // SIGHUP makes dnsmasq re-read dhcp-hostsfile; harmless if the service isn't running yet.
-    run_soft(Ctx { dry: false }, "systemctl", &["kill", "-s", "HUP", "dnsmasq"]);
+    // dhcp-host lines in a conf-file are only read at startup (SIGHUP does not re-read them),
+    // so restart. Leases are kept in dnsmasq's lease file and survive. No-op if not installed yet.
+    run_soft(Ctx { dry: false }, "systemctl", &["restart", "dnsmasq"]);
 }
 
 /// Add or replace a binding (an existing line with the same MAC or IP is dropped first).
@@ -218,7 +231,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
         }
         Some("binds") => {
             for l in read_hosts(&c) {
-                println!("{l}");
+                println!("{HOST_PREFIX}{l}");
             }
             Ok(())
         }

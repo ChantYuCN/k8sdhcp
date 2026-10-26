@@ -44,6 +44,8 @@ sudo ./pxe-installer install --config pxe.conf
 sudo pxe-ctl status                          # per-host: installed / pending / waiting
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
+  # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded by conf-file=);
+  # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
 Flags override the config file (`--iface`, `--server-ip`, `--host mac,ip,name`, `--static-ip` ...); see
 `pxe-installer --help`. The password comes only from the config file or `PXE_TARGET_PASSWORD`.
