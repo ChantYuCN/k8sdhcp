@@ -5,8 +5,15 @@ ISO) and unattended-installs Ubuntu 25.04. Hosts that already finished installin
 bindings supported. The CLI is std-only; the optional GUI uses the `gtk4` crate.
 
 ## Build (Linux or WSL with Rust)
+
+Install Rust SDK.  
 ```
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+
+Complie and Build the binary.  
+```
 sudo apt install libgtk-4-dev build-essential pkg-config curl  # GUI only
 ./build.sh               # tests, static CLI, and the GTK 4 GUI
 ./build.sh --cli-only    # CLI only (std only, no dependencies)
@@ -27,6 +34,7 @@ deleted afterwards. Manage tab: host status, installed hosts, bindings, reinstal
 `install` only installs/enables **dnsmasq** and **Apache** and writes their configuration. It never downloads
 or copies the Ubuntu files - you place them yourself afterwards:
 ```
+# open another terminal and follow the steps listed below.  
 # 1. netboot files (extract the Ubuntu netboot tarball's amd64/* content) into the TFTP root
 sudo cp -r amd64/* /var/lib/tftpboot/
 sudo pxe-ctl grub                      # re-apply our grub.cfg (the tarball ships its own) + permissions
