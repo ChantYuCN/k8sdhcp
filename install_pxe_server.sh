@@ -24,6 +24,15 @@ LEASE="24h"
 UPSTREAM_DNS="8.8.8.8"            # forwarded DNS for clients
 SET_STATIC_IP=0                   # 1 = write+apply netplan for IFACE (don't use over SSH on IFACE!)
 
+# Fixed MAC -> IP bindings, "mac,ip[,hostname]". Use IPs outside the dynamic pool or inside it, both work.
+# Manage later without re-running:  pxe-ctl bind|unbind|binds
+HOSTS=(
+  # "aa:bb:cc:dd:ee:01,192.168.5.11,node01"
+  # "aa:bb:cc:dd:ee:02,192.168.5.12,node02"
+)
+ONLY_KNOWN_HOSTS=0                # 1 = only hosts listed in the bindings get DHCP/PXE (no dynamic leases)
+HOSTS_FILE="/etc/dnsmasq.d/pxe-hosts"
+
 # Autoinstall identity for target hosts (CHANGE the password!)
 TARGET_HOSTNAME="ubuntu-node"
 TARGET_USER="ubuntu"
@@ -80,6 +89,8 @@ fi
 # ---- 3. dnsmasq: one config file for DHCP + DNS + TFTP + UEFI boot ----
 log "Writing dnsmasq config"
 [[ -f /etc/dnsmasq.conf && ! -f /etc/dnsmasq.conf.bak ]] && mv /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
+mkdir -p "$(dirname "$HOSTS_FILE")"
+touch "$HOSTS_FILE"
 cat >/etc/dnsmasq.conf <<EOF
 # --- listen only on the PXE NIC ---
 interface=${IFACE}
@@ -90,6 +101,10 @@ dhcp-range=${DHCP_START},${DHCP_END},${NETMASK},${LEASE}
 dhcp-option=option:router,${SERVER_IP}
 dhcp-option=option:dns-server,${SERVER_IP}
 dhcp-authoritative
+
+# --- static MAC->IP bindings (re-read on SIGHUP, no restart needed) ---
+dhcp-hostsfile=${HOSTS_FILE}
+$([[ "$ONLY_KNOWN_HOSTS" == "1" ]] && echo "dhcp-ignore=tag:!known")
 
 # --- DNS (forward to upstream) ---
 server=${UPSTREAM_DNS}
@@ -153,17 +168,41 @@ chown www-data:www-data "$DONE_DIR"
 
 cat >/usr/local/sbin/pxe-ctl <<EOF
 #!/bin/bash
-# pxe-ctl list | reinstall <mac> | done <mac>
+# pxe-ctl list | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>
+set -u
 D="${DONE_DIR}"
-norm() { echo "\$1" | tr 'A-F-' 'a-f:' ; }
+H="${HOSTS_FILE}"
+norm()  { echo "\$1" | tr 'A-F-' 'a-f:'; }
+isMac() { [[ "\$1" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}\$ ]]; }
+isIp()  { [[ "\$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; }
+reload() { systemctl kill -s HUP dnsmasq 2>/dev/null || true; }
+need_mac() { isMac "\$1" || { echo "invalid MAC: \$1" >&2; exit 1; }; }
+
 case "\${1:-}" in
   list)      ls -l --time-style=long-iso "\$D" | tail -n +2 ;;
-  reinstall) [[ -n "\${2:-}" ]] && rm -fv "\$D/\$(norm "\$2")" ;;
-  done)      [[ -n "\${2:-}" ]] && { date -Is > "\$D/\$(norm "\$2")"; chown www-data: "\$D/\$(norm "\$2")"; } ;;
-  *)         echo "usage: pxe-ctl list | reinstall <mac> | done <mac>"; exit 1 ;;
+  reinstall) mac=\$(norm "\${2:-}"); need_mac "\$mac"; rm -fv "\$D/\$mac" ;;
+  done)      mac=\$(norm "\${2:-}"); need_mac "\$mac"; date -Is > "\$D/\$mac"; chown www-data: "\$D/\$mac" ;;
+  binds)     cat "\$H" ;;
+  bind)      mac=\$(norm "\${2:-}"); ip="\${3:-}"; name="\${4:-}"
+             need_mac "\$mac"; isIp "\$ip" || { echo "invalid IP: \$ip" >&2; exit 1; }
+             # drop any old line using this MAC or this IP, then add the new binding
+             grep -viE "^\$mac,|,\$ip(,|\$)" "\$H" > "\$H.tmp" || true
+             echo "\$mac,\$ip\${name:+,\$name}" >> "\$H.tmp"; mv "\$H.tmp" "\$H"; reload
+             echo "bound \$mac -> \$ip" ;;
+  unbind)    key=\$(norm "\${2:-}"); [[ -n "\$key" ]] || exit 1
+             grep -viE "^\$key,|,\$key(,|\$)" "\$H" > "\$H.tmp" || true
+             mv "\$H.tmp" "\$H"; reload; echo "unbound \$key" ;;
+  *)         echo "usage: pxe-ctl list | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>"; exit 1 ;;
 esac
 EOF
 chmod 755 /usr/local/sbin/pxe-ctl
+
+# Apply the HOSTS bindings from CONFIG (idempotent: replaces entries with the same MAC/IP)
+for entry in "${HOSTS[@]}"; do
+  IFS=, read -r h_mac h_ip h_name <<<"$entry"
+  /usr/local/sbin/pxe-ctl bind "$h_mac" "$h_ip" "${h_name:-}"
+done
+dnsmasq --test
 
 # ---- 6. Apache: ISO, autoinstall files, and the "done" callback CGI ----
 log "Configuring Apache"
@@ -253,5 +292,9 @@ Duplicate-install guard:
   sudo pxe-ctl list               # show installed hosts
   sudo pxe-ctl reinstall <mac>    # allow a host to be installed again
   sudo pxe-ctl done <mac>         # mark an existing host as installed (never PXE-install it)
+Fixed IP bindings (${HOSTS_FILE}):
+  sudo pxe-ctl binds                          # list
+  sudo pxe-ctl bind <mac> <ip> [hostname]     # add/replace, applied immediately
+  sudo pxe-ctl unbind <mac|ip>
 Watch requests with: journalctl -fu dnsmasq
 EOF
