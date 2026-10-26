@@ -6,7 +6,8 @@ bindings supported. The CLI is std-only; the optional GUI uses the `gtk4` crate.
 
 ## Build (Linux or WSL with Rust)
 ```
-sudo apt install libgtk-4-dev build-essential pkg-config   # GUI only
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt install libgtk-4-dev build-essential pkg-config curl  # GUI only
 ./build.sh               # tests, static CLI, and the GTK 4 GUI
 ./build.sh --cli-only    # CLI only (std only, no dependencies)
 ```
