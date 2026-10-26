@@ -1,0 +1,33 @@
+[package]
+name = "pxe-installer"
+version = "0.2.0"
+edition = "2021"
+description = "UEFI PXE server installer (dnsmasq + Apache): static CLI binary plus optional GTK4 GUI"
+
+[lib]
+name = "pxe_installer"
+path = "src/lib.rs"
+
+# CLI: std only, builds offline into one static binary.
+[[bin]]
+name = "pxe-installer"
+path = "src/main.rs"
+
+# GUI: cargo build --release --features gui   (needs GTK 4 dev packages)
+[[bin]]
+name = "pxe-installer-gui"
+path = "src/gui.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:gtk4"]
+
+[dependencies]
+gtk4 = { version = "0.9", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

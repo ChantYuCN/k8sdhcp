@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PXE Server Installer
+Comment=Install a UEFI PXE server (dnsmasq + Apache)
+Exec=/opt/pxe-installer/pxe-installer-gui
+Icon=network-server
+Terminal=false
+Categories=System;Network;
