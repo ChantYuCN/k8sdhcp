@@ -1,6 +1,14 @@
 #!/bin/bash
-# Lite UEFI PXE server: dnsmasq (DHCP + DNS + TFTP) + Apache (HTTP for the ISO)
-# Target OS: Ubuntu 25.04 live-server, installed over the network by UEFI clients.
+# Lite UEFI PXE server: dnsmasq (DHCP + DNS + TFTP) + Apache (HTTP for ISO / autoinstall / done-callback)
+# Target OS: Ubuntu 25.04 live-server, installed unattended over the network by UEFI clients.
+#
+# Duplicate-install protection:
+#   1. The autoinstall's last step calls http://SERVER/cgi-bin/pxe-done?mac=<MAC>
+#      -> server creates  ${TFTP_ROOT}/done/<mac>
+#   2. On every PXE boot grub.cfg checks for that marker. If present it exits grub,
+#      so UEFI firmware falls through to the next boot entry (the installed disk).
+#   A host whose install failed/aborted has no marker, so it retries automatically.
+#   Re-install a host on purpose:  sudo pxe-ctl reinstall <mac>
 #
 # Usage: edit the CONFIG block, then run:  sudo ./pxeserver_installer.sh
 set -euo pipefail
@@ -16,13 +24,20 @@ LEASE="24h"
 UPSTREAM_DNS="8.8.8.8"            # forwarded DNS for clients
 SET_STATIC_IP=0                   # 1 = write+apply netplan for IFACE (don't use over SSH on IFACE!)
 
+# Autoinstall identity for target hosts (CHANGE the password!)
+TARGET_HOSTNAME="ubuntu-node"
+TARGET_USER="ubuntu"
+TARGET_PASSWORD="ChangeMe123!"
+
 RELEASE_URL="https://old-releases.ubuntu.com/releases/plucky"
 NETBOOT_TAR="ubuntu-25.04-netboot-amd64.tar.gz"
 ISO_NAME="ubuntu-25.04-beta-live-server-amd64.iso"
 
 TFTP_ROOT="/var/lib/tftpboot"
+DONE_DIR="${TFTP_ROOT}/done"      # one empty-ish file per installed MAC
 WEB_ROOT="/var/www/html"
 ISO_DIR="${WEB_ROOT}/iso"
+AUTOINSTALL_DIR="${WEB_ROOT}/autoinstall"
 WORKDIR="$(mktemp -d)"
 ##########################################################
 
@@ -30,10 +45,11 @@ WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 log() { echo -e "\n==> $*"; }
+[[ "$TARGET_PASSWORD" == "ChangeMe123!" ]] && echo "WARNING: using the default TARGET_PASSWORD, change it." >&2
 
 log "Installing packages"
 apt-get update -y
-apt-get install -y dnsmasq apache2 wget
+apt-get install -y dnsmasq apache2 wget openssl
 
 # ---- 1. Server network (optional) ----
 if [[ "$SET_STATIC_IP" == "1" ]]; then
@@ -101,31 +117,115 @@ wget -nv -P "$WORKDIR" "${RELEASE_URL}/${NETBOOT_TAR}"
 tar -xzf "${WORKDIR}/${NETBOOT_TAR}" -C "$WORKDIR"
 cp -r "${WORKDIR}"/amd64/* "$TFTP_ROOT/"
 
-# Point the installer at our HTTP server instead of the Internet
-GRUB_CFG="${TFTP_ROOT}/grub/grub.cfg"
-sed -i "s#https\?://releases.ubuntu.com/[^ ]*#http://${SERVER_IP}/iso#g" "$GRUB_CFG"
-# the kernel needs the full ISO file name
-sed -i "s#url=http://${SERVER_IP}/iso\([^/]\)#url=http://${SERVER_IP}/iso/${ISO_NAME}\1#g" "$GRUB_CFG"
+# Our own grub.cfg: skip hosts already installed, otherwise run the autoinstall.
+# (\$ = grub variable, ${...} = filled in by this script; grub needs \; for a literal ;)
+log "Writing grub.cfg (duplicate-install guard)"
+mkdir -p "${TFTP_ROOT}/grub"
+cat >"${TFTP_ROOT}/grub/grub.cfg" <<EOF
+set timeout=5
+set default=0
 
-# Read-only for everyone, owned by root (no 777)
+# Already installed? -> leave grub; UEFI firmware continues with the next boot entry (local disk).
+if [ -f /done/\${net_default_mac} ]; then
+    echo "Host \${net_default_mac} is already installed - booting from local disk."
+    sleep 2
+    exit
+fi
+
+menuentry "Autoinstall Ubuntu 25.04 (WIPES THE DISK)" {
+    echo "Loading kernel..."
+    linux /casper/vmlinuz ip=dhcp url=http://${SERVER_IP}/iso/${ISO_NAME} autoinstall "ds=nocloud-net\;s=http://${SERVER_IP}/autoinstall/" ---
+    initrd /casper/initrd
+}
+menuentry "Boot from local disk" {
+    exit
+}
+EOF
+
+# ---- 5. "Installed" marker directory + admin helper ----
+mkdir -p "$DONE_DIR"
+# everything under TFTP_ROOT: root-owned, read-only (no 777) ...
 chown -R root:root "$TFTP_ROOT"
 find "$TFTP_ROOT" -type d -exec chmod 755 {} +
 find "$TFTP_ROOT" -type f -exec chmod 644 {} +
+# ... except the marker dir, which the Apache CGI (www-data) writes to
+chown www-data:www-data "$DONE_DIR"
 
-# ---- 5. Apache serves the ISO at http://SERVER_IP/iso/ ----
-log "Fetching ISO"
-mkdir -p "$ISO_DIR"
+cat >/usr/local/sbin/pxe-ctl <<EOF
+#!/bin/bash
+# pxe-ctl list | reinstall <mac> | done <mac>
+D="${DONE_DIR}"
+norm() { echo "\$1" | tr 'A-F-' 'a-f:' ; }
+case "\${1:-}" in
+  list)      ls -l --time-style=long-iso "\$D" | tail -n +2 ;;
+  reinstall) [[ -n "\${2:-}" ]] && rm -fv "\$D/\$(norm "\$2")" ;;
+  done)      [[ -n "\${2:-}" ]] && { date -Is > "\$D/\$(norm "\$2")"; chown www-data: "\$D/\$(norm "\$2")"; } ;;
+  *)         echo "usage: pxe-ctl list | reinstall <mac> | done <mac>"; exit 1 ;;
+esac
+EOF
+chmod 755 /usr/local/sbin/pxe-ctl
+
+# ---- 6. Apache: ISO, autoinstall files, and the "done" callback CGI ----
+log "Configuring Apache"
+mkdir -p "$ISO_DIR" "$AUTOINSTALL_DIR"
 [[ -f "${ISO_DIR}/${ISO_NAME}" ]] || wget -nv -c -O "${ISO_DIR}/${ISO_NAME}" "${RELEASE_URL}/${ISO_NAME}"
-chmod 755 "$ISO_DIR"
+chmod 755 "$ISO_DIR" "$AUTOINSTALL_DIR"
 chmod 644 "${ISO_DIR}/${ISO_NAME}"
 
-# ---- 6. Start services ----
-log "Starting services"
-systemctl enable --now apache2
-systemctl enable dnsmasq
-systemctl restart dnsmasq
+PW_HASH="$(openssl passwd -6 "$TARGET_PASSWORD")"
+: >"${AUTOINSTALL_DIR}/meta-data"
+cat >"${AUTOINSTALL_DIR}/user-data" <<EOF
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  identity:
+    hostname: ${TARGET_HOSTNAME}
+    username: ${TARGET_USER}
+    password: '${PW_HASH}'
+  ssh:
+    install-server: true
+    allow-pw: true
+  storage:
+    layout:
+      name: direct
+  # Last step before reboot: tell the PXE server this MAC is done.
+  late-commands:
+    - |
+      IF=\$(ip route show default | awk '{print \$5; exit}')
+      MAC=\$(cat /sys/class/net/\$IF/address)
+      curl -fsS --retry 5 --retry-delay 2 "http://${SERVER_IP}/cgi-bin/pxe-done?mac=\$MAC"
+EOF
+chmod 644 "${AUTOINSTALL_DIR}"/*
 
-# ---- 7. Firewall (only if ufw is active) ----
+cat >/usr/lib/cgi-bin/pxe-done <<EOF
+#!/bin/bash
+mac=\$(echo "\$QUERY_STRING" | sed -n 's/^mac=\\([0-9A-Fa-f:]\\{17\\}\\)\$/\\1/p' | tr 'A-F' 'a-f')
+if [[ -z "\$mac" ]]; then
+  printf 'Status: 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nbad mac\n'
+  exit 0
+fi
+date -Is > "${DONE_DIR}/\$mac"
+printf 'Content-Type: text/plain\r\n\r\nok %s\n' "\$mac"
+EOF
+chmod 755 /usr/lib/cgi-bin/pxe-done
+
+# Only the PXE subnet may call the CGI
+cat >/etc/apache2/conf-available/pxe-done.conf <<EOF
+<Location "/cgi-bin/pxe-done">
+    Require ip ${SERVER_IP%.*}.0/${PREFIX}
+</Location>
+EOF
+a2enmod cgi >/dev/null
+a2enconf serve-cgi-bin pxe-done >/dev/null
+
+# ---- 7. Start services ----
+log "Starting services"
+systemctl enable apache2 dnsmasq
+systemctl restart apache2 dnsmasq
+
+# ---- 8. Firewall (only if ufw is active) ----
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow in on "$IFACE" to any port 67 proto udp   # DHCP
   ufw allow in on "$IFACE" to any port 69 proto udp   # TFTP
@@ -133,10 +233,12 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow in on "$IFACE" to any port 80 proto tcp   # HTTP
 fi
 
-# ---- 8. Sanity checks ----
+# ---- 9. Sanity checks ----
 log "Checks"
 systemctl is-active dnsmasq apache2
 curl -sfI "http://${SERVER_IP}/iso/${ISO_NAME}" | head -n1 || echo "WARNING: ISO not reachable over HTTP"
+curl -sf  "http://${SERVER_IP}/autoinstall/user-data" >/dev/null || echo "WARNING: autoinstall user-data not reachable"
+curl -s   "http://${SERVER_IP}/cgi-bin/pxe-done?mac=bad" | grep -q "bad mac" || echo "WARNING: pxe-done CGI not working"
 [[ -f "${TFTP_ROOT}/bootx64.efi" ]] || echo "WARNING: ${TFTP_ROOT}/bootx64.efi missing"
 
 cat <<EOF
@@ -145,5 +247,11 @@ PXE server ready.
   DHCP/TFTP : ${SERVER_IP} (${DHCP_START}-${DHCP_END})
   HTTP ISO  : http://${SERVER_IP}/iso/${ISO_NAME}
 Boot the target host in UEFI mode with "PXE IPv4" as first boot device.
+
+Duplicate-install guard:
+  Installed hosts are recorded in ${DONE_DIR}/<mac>
+  sudo pxe-ctl list               # show installed hosts
+  sudo pxe-ctl reinstall <mac>    # allow a host to be installed again
+  sudo pxe-ctl done <mac>         # mark an existing host as installed (never PXE-install it)
 Watch requests with: journalctl -fu dnsmasq
 EOF
