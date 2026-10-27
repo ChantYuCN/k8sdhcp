@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::{is_mac, normalize_mac, Config};
+use crate::config::{is_hostname, is_mac, normalize_mac, Config};
 use crate::render;
 use crate::util::{mkdir, now_iso, probe, run, run_soft, write_file, Ctx};
 
@@ -90,6 +90,9 @@ pub fn bind(c: &Config, mac: &str, ip: &str, name: &str, reload: bool) -> Result
     }
     if !is_ip(ip) {
         return Err(format!("invalid IP: {ip}"));
+    }
+    if !name.is_empty() && !is_hostname(name) {
+        return Err(format!("invalid hostname: {name} (use a-z, 0-9 and '-')"));
     }
     let mut lines: Vec<String> = read_hosts(c)
         .into_iter()
@@ -262,6 +265,73 @@ pub fn cgi_done() -> Result<(), String> {
     Ok(())
 }
 
+/// Replace the `hostname:` value in an autoinstall user-data (indentation kept).
+pub fn set_hostname(user_data: &str, host: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in user_data.lines() {
+        if line.trim_start().starts_with("hostname:") {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push(format!("{indent}hostname: {host}"));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n") + "\n"
+}
+
+/// Hostname bound to this MAC (third field of its binding), if any and valid.
+fn hostname_for(c: &Config, mac: &str) -> Option<String> {
+    for l in read_hosts(c) {
+        let mut f = l.split(',');
+        if f.next().map(|m| m.eq_ignore_ascii_case(mac)).unwrap_or(false) {
+            let _ip = f.next();
+            let name = f.next().unwrap_or("").trim().to_string();
+            if is_hostname(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn cgi_error(status: &str, msg: &str) {
+    print!("Status: {status}\r\nContent-Type: text/plain\r\n\r\n{msg}\n");
+}
+
+/// `pxe-installer cgi-seed` - Apache CGI at /cgi-bin/pxe-seed/<mac>/{user-data,meta-data}.
+/// The installer fetches its autoinstall seed from here (grub.cfg passes its own MAC), so each
+/// machine gets the hostname bound to its MAC; MACs without a binding get the default hostname.
+pub fn cgi_seed() -> Result<(), String> {
+    let c = Config::load_runtime();
+    let path = std::env::var("PATH_INFO").unwrap_or_default();
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if parts.len() != 2 {
+        cgi_error("404 Not Found", "expected /<mac>/user-data");
+        return Ok(());
+    }
+    let mac = normalize_mac(parts[0]);
+    if !is_mac(&mac) {
+        cgi_error("400 Bad Request", "bad mac");
+        return Ok(());
+    }
+    match parts[1] {
+        "meta-data" => print!("Content-Type: text/plain\r\n\r\n"),
+        "user-data" => {
+            let base = match fs::read_to_string(format!("{}/autoinstall/user-data", c.web_root)) {
+                Ok(t) => t,
+                Err(e) => {
+                    cgi_error("500 Internal Server Error", &format!("default user-data missing: {e}"));
+                    return Ok(());
+                }
+            };
+            let host = hostname_for(&c, &mac).unwrap_or_else(|| c.target_hostname.clone());
+            print!("Content-Type: text/plain\r\n\r\n{}", set_hostname(&base, &host));
+        }
+        _ => cgi_error("404 Not Found", "unknown file"),
+    }
+    Ok(())
+}
+
 /// Used by `install` to check a service is up.
 pub fn service_active(name: &str) -> bool {
     probe("systemctl", &["is-active", "--quiet", name])
@@ -296,6 +366,26 @@ mod tests {
         let c = tmp_cfg("bad");
         assert!(bind(&c, "nope", "192.168.5.11", "", false).is_err());
         assert!(bind(&c, "aa:bb:cc:dd:ee:01", "300.1.1.1", "", false).is_err());
+    }
+
+    #[test]
+    fn hostname_replaced_per_mac() {
+        let base = "autoinstall:\n  identity:\n    hostname: ubuntu-node\n    username: ubuntu\n";
+        let out = set_hostname(base, "node07");
+        assert!(out.contains("    hostname: node07\n"));
+        assert!(out.contains("username: ubuntu"));
+        assert!(!out.contains("ubuntu-node"));
+    }
+
+    #[test]
+    fn hostname_lookup_from_binding() {
+        let c = tmp_cfg("hn");
+        bind(&c, "aa:bb:cc:dd:ee:01", "192.168.5.11", "node01", false).unwrap();
+        bind(&c, "aa:bb:cc:dd:ee:02", "192.168.5.12", "", false).unwrap();
+        assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:01"), Some("node01".to_string()));
+        assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:02"), None);
+        assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:09"), None);
+        assert!(bind(&c, "aa:bb:cc:dd:ee:03", "192.168.5.13", "Bad_Name", false).is_err());
     }
 
     #[test]

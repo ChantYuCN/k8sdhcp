@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::ctl;
-use crate::render::{self, CGI_PATH, CTL_WRAPPER_PATH, SELF_PATH};
+use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
 pub fn install(c: &Config) -> Result<(), String> {
@@ -140,6 +140,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
     write_file(ctx, &format!("{ai_dir}/meta-data"), "", 0o644, false)?;
     write_file(ctx, &format!("{ai_dir}/user-data"), &render::user_data(c, &pw_hash), 0o644, false)?;
     write_file(ctx, CGI_PATH, &render::cgi_wrapper(), 0o755, false)?;
+    write_file(ctx, CGI_SEED_PATH, &render::cgi_seed_wrapper(), 0o755, false)?;
     write_file(ctx, "/etc/apache2/conf-available/pxe-done.conf", &render::apache_conf(c), 0o644, false)?;
     run(ctx, "a2enmod", &["cgi"])?;
     run(ctx, "a2enconf", &["serve-cgi-bin", "pxe-done"])?;

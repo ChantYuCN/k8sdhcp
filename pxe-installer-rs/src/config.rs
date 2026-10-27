@@ -79,7 +79,7 @@ fn parse_bool(v: &str) -> Result<bool, String> {
     }
 }
 
-fn is_hostname(h: &str) -> bool {
+pub fn is_hostname(h: &str) -> bool {
     let b = h.as_bytes();
     !b.is_empty()
         && b.len() <= 63
@@ -348,8 +348,9 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\n",
-            self.tftp_root, self.web_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name
+            "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nTARGET_HOSTNAME={}\n",
+            self.tftp_root, self.web_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
+            self.target_hostname
         )
     }
 

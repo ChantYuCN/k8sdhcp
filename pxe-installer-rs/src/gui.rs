@@ -253,7 +253,7 @@ fn install_tab() -> gtk::Widget {
     let t_pw = secret("");
     let t_pw2 = secret("");
     let iso = entry(&d.iso_name);
-    grid_row(&tgt, 0, "Target hostname", &t_host);
+    grid_row(&tgt, 0, "Default hostname (no binding)", &t_host);
     grid_row(&tgt, 1, "Target username", &t_user);
     grid_row(&tgt, 2, "Target password", &t_pw);
     grid_row(&tgt, 3, "Repeat password", &t_pw2);

@@ -12,7 +12,7 @@ USAGE
   pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
-  pxe-installer cgi-done                (internal) Apache callback
+  pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
 
 INSTALL OPTIONS  (flags override --config; same names as config keys)
   --iface NAME  --server-ip IP  --prefix N  --dhcp-start IP  --dhcp-end IP
@@ -56,6 +56,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         Some("ctl") => ctl::ctl(&args[2..]),
         Some("cgi-done") => ctl::cgi_done(),
+        Some("cgi-seed") => ctl::cgi_seed(),
         Some("print-config") => {
             print!("{SAMPLE_CONFIG}");
             Ok(())

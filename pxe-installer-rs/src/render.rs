@@ -47,7 +47,7 @@ fi
 
 menuentry "Autoinstall Ubuntu 25.04 (WIPES THE DISK)" {
     echo "Loading kernel..."
-    linux /casper/vmlinuz ip=dhcp url=http://@SERVER_IP@/iso/@ISO_NAME@ autoinstall "ds=nocloud-net\;s=http://@SERVER_IP@/autoinstall/" ---
+    linux /casper/vmlinuz ip=dhcp url=http://@SERVER_IP@/iso/@ISO_NAME@ autoinstall "ds=nocloud-net\;s=http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/" ---
     initrd /casper/initrd
 }
 menuentry "Boot from local disk" {
@@ -91,11 +91,15 @@ const APACHE_CONF: &str = "\
 <Location \"/cgi-bin/pxe-done\">
     Require ip @NETWORK@/@PREFIX@
 </Location>
+<Location \"/cgi-bin/pxe-seed\">
+    Require ip @NETWORK@/@PREFIX@
+</Location>
 ";
 
 pub const SELF_PATH: &str = "/usr/local/sbin/pxe-installer";
 pub const CTL_WRAPPER_PATH: &str = "/usr/local/sbin/pxe-ctl";
 pub const CGI_PATH: &str = "/usr/lib/cgi-bin/pxe-done";
+pub const CGI_SEED_PATH: &str = "/usr/lib/cgi-bin/pxe-seed";
 
 pub fn dnsmasq_conf(c: &Config) -> String {
     let only_known = if c.only_known_hosts { "dhcp-ignore=tag:!known\n" } else { "" };
@@ -149,6 +153,11 @@ pub fn cgi_wrapper() -> String {
     format!("#!/bin/sh\nexec {SELF_PATH} cgi-done\n")
 }
 
+/// CGI shim that serves a per-MAC autoinstall seed (user-data/meta-data), see ctl::cgi_seed.
+pub fn cgi_seed_wrapper() -> String {
+    format!("#!/bin/sh\nexec {SELF_PATH} cgi-seed\n")
+}
+
 pub fn ctl_wrapper() -> String {
     format!("#!/bin/sh\nexec {SELF_PATH} ctl \"$@\"\n")
 }
@@ -183,7 +192,7 @@ mod tests {
         let s = grub_cfg(&cfg());
         assert!(s.contains("/done/${net_default_mac}"));
         assert!(s.contains("url=http://192.168.5.1/iso/ubuntu-25.04-beta-live-server-amd64.iso"));
-        assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/autoinstall/"));
+        assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/"));
         assert!(!s.contains('@'));
     }
 
@@ -197,6 +206,8 @@ mod tests {
 
     #[test]
     fn apache_network() {
-        assert!(apache_conf(&cfg()).contains("Require ip 192.168.5.0/24"));
+        let a = apache_conf(&cfg());
+        assert!(a.contains("Require ip 192.168.5.0/24"));
+        assert!(a.contains("/cgi-bin/pxe-seed"));
     }
 }

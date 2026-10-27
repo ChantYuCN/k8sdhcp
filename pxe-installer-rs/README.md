@@ -43,7 +43,7 @@ sudo cp ubuntu-25.04-live-server-amd64.iso /var/www/html/iso/
 ```
 `install` finishes by printing these next steps and noting which files are still missing.
 
-## Use
+## CLI
 ```
 pxe-installer print-config > pxe.conf       # edit it (set TARGET_PASSWORD!)
 sudo ./pxe-installer install --config pxe.conf --dry-run   # show everything it would do/write
@@ -57,6 +57,14 @@ sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
 ```
 Flags override the config file (`--iface`, `--server-ip`, `--host mac,ip,name`, `--static-ip` ...); see
 `pxe-installer --help`. The password comes only from the config file or `PXE_TARGET_PASSWORD`.
+
+## Per-MAC hostname at install time
+Each target fetches its autoinstall seed from `http://SERVER/cgi-bin/pxe-seed/<its MAC>/user-data`
+(`grub.cfg` passes `${net_default_mac}`). The CGI (`pxe-installer cgi-seed`) takes the default `user-data`
+and sets `identity.hostname` to the **hostname bound to that MAC** (`pxe-ctl bind <mac> <ip> <hostname>` /
+Manage tab). A MAC without a bound hostname gets the default hostname (`TARGET_HOSTNAME`, the GUI's
+"Default hostname" field). So bind first, then PXE boot the host. After upgrading, re-run `install` (it adds
+the new CGI and Apache rule) so the new `grub.cfg` and seed endpoint are in place.
 
 ## How duplicate installs are prevented
 The autoinstall's last step calls `http://SERVER/cgi-bin/pxe-done?mac=..`, which runs
