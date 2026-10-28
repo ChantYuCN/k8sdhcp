@@ -27,7 +27,7 @@ Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) a
 ```
 Install tab: network/DHCP, target credentials, MAC->IP bindings (one `mac,ip[,hostname]` per line) -> **Install**.
 It validates with the same code as the CLI, writes a mode-600 temp config, runs
-`pkexec pxe-installer install --config ...` and streams the output with a progress bar; the temp file is
+`pxe-installer install --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt) and streams the output with a progress bar; the temp file is
 deleted afterwards. Manage tab: host status, installed hosts, bindings, reinstall / mark installed / bind / unbind.
 
 ## What it does NOT do: netboot image and ISO

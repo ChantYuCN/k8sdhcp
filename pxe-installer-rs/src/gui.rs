@@ -1,5 +1,5 @@
 //! GTK 4 front-end. Collects settings, validates them with the same code as the CLI, then runs
-//! `pkexec pxe-installer install --config <temp file>` and streams its output.
+//! `pxe-installer install --config <temp file>` as root (directly, `sudo -n`, or pkexec) and streams its output.
 //! Build: cargo build --release --features gui
 use gtk4 as gtk;
 
@@ -27,6 +27,45 @@ enum Msg {
 // ------------------------------------------------------------------ process helpers
 
 /// The CLI binary: $PXE_INSTALLER_BIN, next to this executable, or the installed copy.
+/// Command that runs `installer` as root, asking for a password only when it has to:
+/// already root -> run directly; passwordless sudo -> `sudo -n`; otherwise the pkexec prompt.
+fn privileged(installer: &std::path::Path) -> Command {
+    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let quiet = |prog: &str, args: &[&str]| {
+        Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let mode = *MODE.get_or_init(|| {
+        let is_root = Command::new("id").arg("-u").output().map(|o| o.stdout.starts_with(b"0")).unwrap_or(false);
+        if is_root {
+            "direct"
+        } else if quiet("sudo", &["-n", "true"]) {
+            "sudo"
+        } else {
+            "pkexec"
+        }
+    });
+    match mode {
+        "direct" => Command::new(installer),
+        "sudo" => {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg(installer);
+            c
+        }
+        _ => {
+            let mut c = Command::new("pkexec");
+            c.arg(installer);
+            c
+        }
+    }
+}
+
 fn find_installer() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(p) = std::env::var("PXE_INSTALLER_BIN") {
@@ -228,7 +267,7 @@ struct RunUi {
     buttons: Vec<gtk::Button>,
 }
 
-/// Runs `pxe-installer <sub> --config <form>` via pkexec, streaming output into the log and progress bar.
+/// Runs `pxe-installer <sub> --config <form>` as root (see `privileged`), streaming output into the log and progress bar.
 fn run_installer(sub: &str, total_steps: f64, done_msg: &'static str, cfg: Result<Config, String>, ui: &Rc<RunUi>) {
     let cfg = match cfg {
         Ok(c) => c,
@@ -259,8 +298,8 @@ fn run_installer(sub: &str, total_steps: f64, done_msg: &'static str, cfg: Resul
     ui.progress.set_fraction(0.0);
     ui.step_label.set_text("Waiting for administrator authentication...");
 
-    let mut cmd = Command::new("pkexec");
-    cmd.arg(&installer).arg(sub).arg("--config").arg(&conf_path);
+    let mut cmd = privileged(&installer);
+    cmd.arg(sub).arg("--config").arg(&conf_path);
     let rx = spawn_stream(cmd, Some(conf_path));
 
     let steps = Rc::new(Cell::new(0u32));
@@ -406,8 +445,8 @@ fn run_ctl(args: Vec<String>, log: &gtk::TextView) {
         return;
     };
     append(log, &format!("$ pxe-ctl {}\n", args.join(" ")));
-    let mut cmd = Command::new("pkexec");
-    cmd.arg(&installer).arg("ctl").args(&args);
+    let mut cmd = privileged(&installer);
+    cmd.arg("ctl").args(&args);
     let rx = spawn_stream(cmd, None);
     let l1 = log.clone();
     let l2 = log.clone();
