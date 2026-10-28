@@ -1,4 +1,5 @@
-//! The `install` command: installs and enables dnsmasq + Apache and writes their PXE configuration.
+//! The `install` command installs dnsmasq + Apache and creates the directories; the `start` command
+//! writes their PXE configuration and starts them.
 //! It does NOT download or copy the netboot image or the ISO - the admin places those manually.
 use std::fs;
 use std::path::Path;
@@ -8,7 +9,9 @@ use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
-pub fn install(c: &Config) -> Result<(), String> {
+const PACKAGES: [&str; 4] = ["dnsmasq", "apache2", "curl", "openssl"];
+
+fn prepare(c: &Config) -> Result<Ctx, String> {
     let errs = c.validate();
     if !errs.is_empty() {
         return Err(format!("invalid configuration:\n  - {}", errs.join("\n  - ")));
@@ -20,15 +23,71 @@ pub fn install(c: &Config) -> Result<(), String> {
     if ctx.dry {
         println!("[dry-run] nothing will be changed; showing what would be done");
     }
+    Ok(ctx)
+}
+
+/// `install`: packages + directories only. Nothing is configured and the services are left stopped;
+/// `start` does the configuration.
+pub fn install(c: &Config) -> Result<(), String> {
+    let ctx = prepare(c)?;
+
+    step("Installing packages");
+    run(ctx, "apt-get", &["update", "-y"])?;
+    let mut apt = vec!["install", "-y"];
+    apt.extend(PACKAGES);
+    run(ctx, "apt-get", &apt)?;
+
+    step("Creating directories");
+    for dir in [format!("{}/iso", c.web_root), format!("{}/autoinstall", c.web_root), c.tftp_root.clone()] {
+        mkdir(ctx, &dir)?;
+        set_mode_soft(ctx, &dir, 0o755);
+    }
+
+    step("Checking installation");
+    if !ctx.dry {
+        check_packages()?;
+        for svc in ["dnsmasq", "apache2"] {
+            println!("{svc}: {}", if ctl::service_active(svc) { "running" } else { "not running" });
+        }
+    }
+
+    step("Stopping services");
+    run(ctx, "systemctl", &["stop", "dnsmasq", "apache2"])?;
+
+    println!(
+        "\nPXE packages are installed and the services are stopped.\n\
+         Next: set the network/DHCP/target options and click \"Start PXE server\" (or: pxe-installer start)."
+    );
+    Ok(())
+}
+
+fn check_packages() -> Result<(), String> {
+    let missing: Vec<&str> = PACKAGES.iter().copied().filter(|p| !probe("dpkg", &["-s", p])).collect();
+    if missing.is_empty() {
+        println!("packages installed: {}", PACKAGES.join(", "));
+        Ok(())
+    } else {
+        Err(format!("not installed: {}. Run the Install step first.", missing.join(", ")))
+    }
+}
+
+/// `start`: verify the packages, write all configuration, then (re)start dnsmasq + Apache.
+pub fn start(c: &Config) -> Result<(), String> {
+    let ctx = prepare(c)?;
 
     if c.only_known_hosts && c.bindings.is_empty() {
         warn("ONLY_KNOWN_HOSTS is on but no bindings were given: no host will get an address until you bind MACs (Manage tab / pxe-ctl bind)");
     }
 
+    step("Checking dnsmasq and Apache are installed");
+    if !ctx.dry {
+        check_packages()?;
+    }
+
     steps(c, ctx)?;
 
     println!(
-        "\nPXE services are installed and running ({} / {}-{}).\n\n\
+        "\nPXE services are running ({} / {}-{}).\n\n\
          NEXT STEPS (manual - this installer does not download or copy these files):\n\
          \x20 1. Netboot files (bootx64.efi, grubx64.efi, casper/vmlinuz, casper/initrd, ...)\n\
          \x20      -> copy into {}/\n\
@@ -54,12 +113,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
     let iso_dir = format!("{}/iso", c.web_root);
     let ai_dir = format!("{}/autoinstall", c.web_root);
 
-    // ---- 1. packages ----
-    step("Installing packages");
-    run(ctx, "apt-get", &["update", "-y"])?;
-    run(ctx, "apt-get", &["install", "-y", "dnsmasq", "apache2", "curl", "openssl"])?;
-
-    // ---- 2. server network (optional) ----
+    // ---- 1. server network (optional) ----
     if c.set_static_ip {
         step(&format!("Configuring static IP {}/{} on {}", c.server_ip, c.prefix, c.iface));
         write_file(ctx, "/etc/netplan/60-pxe.yaml", &render::netplan(c), 0o600, false)?;

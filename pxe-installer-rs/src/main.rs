@@ -8,13 +8,14 @@ const USAGE: &str = "\
 pxe-installer - UEFI PXE server installer (dnsmasq + Apache)
 
 USAGE
-  pxe-installer install [--config FILE] [--dry-run] [options]
+  pxe-installer install [--config FILE] [--dry-run] [options]   install packages + create directories, services left stopped
+  pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/autoinstall, start dnsmasq + Apache
   pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
 
-INSTALL OPTIONS  (flags override --config; same names as config keys)
+INSTALL/START OPTIONS  (flags override --config; same names as config keys)
   --iface NAME  --server-ip IP  --prefix N  --dhcp-start IP  --dhcp-end IP
   --lease 24h  --upstream-dns IP  --static-ip  --only-known-hosts
   --target-hostname H  --target-user U  --iso-name FILE.iso   (ISO file name you place in <web-root>/iso/)
@@ -53,6 +54,10 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("install") => {
             let cfg = config::Config::from_args(&args[2..])?;
             install::install(&cfg)
+        }
+        Some("start") => {
+            let cfg = config::Config::from_args(&args[2..])?;
+            install::start(&cfg)
         }
         Some("ctl") => ctl::ctl(&args[2..]),
         Some("cgi-done") => ctl::cgi_done(),

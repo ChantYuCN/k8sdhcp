@@ -18,7 +18,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Number of "==> " step markers a full install prints.
-const TOTAL_STEPS: f64 = 8.0;
 
 enum Msg {
     Line(String),
@@ -220,6 +219,80 @@ impl Form {
     }
 }
 
+/// Widgets updated while an installer subcommand runs.
+struct RunUi {
+    log: gtk::TextView,
+    step_label: gtk::Label,
+    progress: gtk::ProgressBar,
+    /// disabled while a run is in progress
+    buttons: Vec<gtk::Button>,
+}
+
+/// Runs `pxe-installer <sub> --config <form>` via pkexec, streaming output into the log and progress bar.
+fn run_installer(sub: &str, total_steps: f64, done_msg: &'static str, form: &Form, ui: &Rc<RunUi>) {
+    let cfg = match form.collect() {
+        Ok(c) => c,
+        Err(e) => {
+            ui.log.buffer().set_text("");
+            append(&ui.log, &format!("{e}
+"));
+            ui.step_label.set_text("Fix the problems listed below.");
+            return;
+        }
+    };
+    let Some(installer) = find_installer() else {
+        ui.log.buffer().set_text("");
+        append(&ui.log, "pxe-installer binary not found next to this app. Build it or set PXE_INSTALLER_BIN.
+");
+        return;
+    };
+    let conf_path = match write_temp_conf(&cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            append(&ui.log, &format!("cannot write temp config: {e}
+"));
+            return;
+        }
+    };
+
+    ui.log.buffer().set_text("");
+    for b in &ui.buttons {
+        b.set_sensitive(false);
+    }
+    ui.progress.set_fraction(0.0);
+    ui.step_label.set_text("Waiting for administrator authentication...");
+
+    let mut cmd = Command::new("pkexec");
+    cmd.arg(&installer).arg(sub).arg("--config").arg(&conf_path);
+    let rx = spawn_stream(cmd, Some(conf_path));
+
+    let steps = Rc::new(Cell::new(0u32));
+    let (ui1, ui2) = (ui.clone(), ui.clone());
+    let sub = sub.to_string();
+    pump(
+        rx,
+        move |line| {
+            append(&ui1.log, line);
+            if let Some(rest) = line.strip_prefix("==> ") {
+                steps.set(steps.get() + 1);
+                ui1.step_label.set_text(rest.trim());
+            }
+            ui1.progress.set_fraction((steps.get() as f64 / total_steps).min(0.99));
+        },
+        move |code| {
+            for b in &ui2.buttons {
+                b.set_sensitive(true);
+            }
+            if code == 0 {
+                ui2.progress.set_fraction(1.0);
+                ui2.step_label.set_text(done_msg);
+            } else {
+                ui2.step_label.set_text(&format!("{sub} failed (exit code {code}). See the log."));
+            }
+        },
+    );
+}
+
 fn install_tab() -> gtk::Widget {
     let d = Config::default();
     let ifaces = interfaces();
@@ -235,7 +308,7 @@ fn install_tab() -> gtk::Widget {
     let dhcp_end = entry(&d.dhcp_end);
     let lease = entry(&d.lease);
     let dns = entry(&d.upstream_dns);
-    let static_ip = gtk::CheckButton::with_label("Configure this static IP on the interface (netplan) - not over SSH on that NIC");
+    let static_ip = gtk::CheckButton::with_label("Configure this static IP on the pxe installer interface (netplan) - DO NOT click this checkbox if your connection over SSH on that NIC");
     let only_known = gtk::CheckButton::with_label("Only serve hosts bound on the Manage tab (ignore unknown hosts)");
     grid_row(&net, 0, "Interface (facing targets)", &iface);
     grid_row(&net, 1, "Server IP", &server_ip);
@@ -273,7 +346,10 @@ fn install_tab() -> gtk::Widget {
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
-    install_btn.add_css_class("suggested-action");
+    install_btn.set_tooltip_text(Some("Installs dnsmasq + Apache and creates the directories; services are left stopped"));
+    let start_btn = gtk::Button::with_label("Start PXE server");
+    start_btn.add_css_class("suggested-action");
+    start_btn.set_tooltip_text(Some("Writes the network/DHCP/autoinstall configuration and starts dnsmasq + Apache"));
     let stop_btn = gtk::Button::with_label("Stop PXE server");
     stop_btn.add_css_class("destructive-action");
     stop_btn.set_tooltip_text(Some("Stops dnsmasq (DHCP/TFTP) and Apache so no host can PXE boot"));
@@ -284,6 +360,7 @@ fn install_tab() -> gtk::Widget {
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.append(&install_btn);
+    row.append(&start_btn);
     row.append(&stop_btn);
     row.append(&progress);
 
@@ -299,71 +376,26 @@ fn install_tab() -> gtk::Widget {
         t_host, t_user, t_pw, t_pw2, iso,
     };
 
+    let form = Rc::new(form);
+    let ui = Rc::new(RunUi { log, step_label, progress, buttons: vec![install_btn.clone(), start_btn.clone()] });
+
     {
-        let (log, step_label) = (log.clone(), step_label.clone());
+        let ui = ui.clone();
         stop_btn.connect_clicked(move |_| {
-            log.buffer().set_text("");
-            step_label.set_text("Stopping PXE server (dnsmasq + Apache)...");
-            run_ctl(vec!["stop".to_string()], &log);
+            ui.log.buffer().set_text("");
+            ui.step_label.set_text("Stopping PXE server (dnsmasq + Apache)...");
+            run_ctl(vec!["stop".to_string()], &ui.log);
         });
     }
 
-    install_btn.connect_clicked(move |btn| {
-        let cfg = match form.collect() {
-            Ok(c) => c,
-            Err(e) => {
-                log.buffer().set_text("");
-                append(&log, &format!("{e}\n"));
-                step_label.set_text("Fix the problems listed below.");
-                return;
-            }
-        };
-        let Some(installer) = find_installer() else {
-            log.buffer().set_text("");
-            append(&log, "pxe-installer binary not found next to this app. Build it or set PXE_INSTALLER_BIN.\n");
-            return;
-        };
-        let conf_path = match write_temp_conf(&cfg) {
-            Ok(p) => p,
-            Err(e) => {
-                append(&log, &format!("cannot write temp config: {e}\n"));
-                return;
-            }
-        };
-
-        log.buffer().set_text("");
-        btn.set_sensitive(false);
-        progress.set_fraction(0.0);
-        step_label.set_text("Waiting for administrator authentication...");
-
-        let mut cmd = Command::new("pkexec");
-        cmd.arg(&installer).arg("install").arg("--config").arg(&conf_path);
-        let rx = spawn_stream(cmd, Some(conf_path));
-
-        let steps = Rc::new(Cell::new(0u32));
-        let (log2, label2, prog2) = (log.clone(), step_label.clone(), progress.clone());
-        let (label3, prog3, btn3) = (step_label.clone(), progress.clone(), btn.clone());
-        let steps2 = steps.clone();
-        pump(
-            rx,
-            move |line| {
-                append(&log2, line);
-                if let Some(rest) = line.strip_prefix("==> ") {
-                    steps2.set(steps2.get() + 1);
-                    label2.set_text(rest.trim());
-                }
-                prog2.set_fraction((steps2.get() as f64 / TOTAL_STEPS).min(0.99));
-            },
-            move |code| {
-                btn3.set_sensitive(true);
-                if code == 0 {
-                    prog3.set_fraction(1.0);
-                    label3.set_text("PXE server installed. Boot targets in UEFI mode, PXE first.");
-                } else {
-                    label3.set_text(&format!("Installation failed (exit code {code}). See the log."));
-                }
-            },
-        );
+    {
+        let (form, ui) = (form.clone(), ui.clone());
+        install_btn.connect_clicked(move |_| {
+            run_installer("install", 4.0, "PXE packages installed; services stopped. Click \"Start PXE server\" next.", &form, &ui)
+        });
+    }
+    start_btn.connect_clicked(move |_| {
+        run_installer("start", 9.0, "PXE server running. Boot targets in UEFI mode, PXE first.", &form, &ui)
     });
 
     outer.upcast()

@@ -223,7 +223,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             for svc in ["dnsmasq", "apache2"] {
                 println!("{svc}: {}", if service_active(svc) { "STILL ACTIVE" } else { "stopped" });
             }
-            println!("PXE server stopped. Start it again with the Install button or: sudo systemctl start dnsmasq apache2");
+            println!("PXE server stopped. Start it again with the Start button or: sudo systemctl start dnsmasq apache2");
             Ok(())
         }
         Some("grub") => {
