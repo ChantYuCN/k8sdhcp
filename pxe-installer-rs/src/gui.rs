@@ -229,28 +229,25 @@ struct RunUi {
 }
 
 /// Runs `pxe-installer <sub> --config <form>` via pkexec, streaming output into the log and progress bar.
-fn run_installer(sub: &str, total_steps: f64, done_msg: &'static str, form: &Form, ui: &Rc<RunUi>) {
-    let cfg = match form.collect() {
+fn run_installer(sub: &str, total_steps: f64, done_msg: &'static str, cfg: Result<Config, String>, ui: &Rc<RunUi>) {
+    let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
             ui.log.buffer().set_text("");
-            append(&ui.log, &format!("{e}
-"));
+            append(&ui.log, &format!("{e}\n"));
             ui.step_label.set_text("Fix the problems listed below.");
             return;
         }
     };
     let Some(installer) = find_installer() else {
         ui.log.buffer().set_text("");
-        append(&ui.log, "pxe-installer binary not found next to this app. Build it or set PXE_INSTALLER_BIN.
-");
+        append(&ui.log, "pxe-installer binary not found next to this app. Build it or set PXE_INSTALLER_BIN.\n");
         return;
     };
     let conf_path = match write_temp_conf(&cfg) {
         Ok(p) => p,
         Err(e) => {
-            append(&ui.log, &format!("cannot write temp config: {e}
-"));
+            append(&ui.log, &format!("cannot write temp config: {e}\n"));
             return;
         }
     };
@@ -376,7 +373,6 @@ fn install_tab() -> gtk::Widget {
         t_host, t_user, t_pw, t_pw2, iso,
     };
 
-    let form = Rc::new(form);
     let ui = Rc::new(RunUi { log, step_label, progress, buttons: vec![install_btn.clone(), start_btn.clone()] });
 
     {
@@ -389,13 +385,14 @@ fn install_tab() -> gtk::Widget {
     }
 
     {
-        let (form, ui) = (form.clone(), ui.clone());
+        // Install needs none of the form values (and so none of its validation, e.g. the password)
+        let ui = ui.clone();
         install_btn.connect_clicked(move |_| {
-            run_installer("install", 4.0, "PXE packages installed; services stopped. Click \"Start PXE server\" next.", &form, &ui)
+            run_installer("install", 4.0, "PXE packages installed; services stopped. Click \"Start PXE server\" next.", Ok(Config::default()), &ui)
         });
     }
     start_btn.connect_clicked(move |_| {
-        run_installer("start", 9.0, "PXE server running. Boot targets in UEFI mode, PXE first.", &form, &ui)
+        run_installer("start", 9.0, "PXE server running. Boot targets in UEFI mode, PXE first.", form.collect(), &ui)
     });
 
     outer.upcast()

@@ -11,10 +11,13 @@ use crate::util::*;
 
 const PACKAGES: [&str; 4] = ["dnsmasq", "apache2", "curl", "openssl"];
 
-fn prepare(c: &Config) -> Result<Ctx, String> {
-    let errs = c.validate();
-    if !errs.is_empty() {
-        return Err(format!("invalid configuration:\n  - {}", errs.join("\n  - ")));
+/// `validate`: `start` needs a complete config (incl. the target password); `install` only needs the paths.
+fn prepare(c: &Config, validate: bool) -> Result<Ctx, String> {
+    if validate {
+        let errs = c.validate();
+        if !errs.is_empty() {
+            return Err(format!("invalid configuration:\n  - {}", errs.join("\n  - ")));
+        }
     }
     let ctx = Ctx { dry: c.dry_run };
     if !ctx.dry && output("id", &["-u"])? != "0" {
@@ -29,7 +32,7 @@ fn prepare(c: &Config) -> Result<Ctx, String> {
 /// `install`: packages + directories only. Nothing is configured and the services are left stopped;
 /// `start` does the configuration.
 pub fn install(c: &Config) -> Result<(), String> {
-    let ctx = prepare(c)?;
+    let ctx = prepare(c, false)?;
 
     step("Installing packages");
     run(ctx, "apt-get", &["update", "-y"])?;
@@ -73,7 +76,7 @@ fn check_packages() -> Result<(), String> {
 
 /// `start`: verify the packages, write all configuration, then (re)start dnsmasq + Apache.
 pub fn start(c: &Config) -> Result<(), String> {
-    let ctx = prepare(c)?;
+    let ctx = prepare(c, true)?;
 
     if c.only_known_hosts && c.bindings.is_empty() {
         warn("ONLY_KNOWN_HOSTS is on but no bindings were given: no host will get an address until you bind MACs (Manage tab / pxe-ctl bind)");
