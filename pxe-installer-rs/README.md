@@ -52,7 +52,7 @@ sudo ./pxe-installer install --config pxe.conf
 sudo pxe-ctl status                          # per-host: installed / pending / waiting
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
-  # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded by conf-file=);
+  # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
 Flags override the config file (`--iface`, `--server-ip`, `--host mac,ip,name`, `--static-ip` ...); see
@@ -72,7 +72,7 @@ The autoinstall's last step calls `http://SERVER/cgi-bin/pxe-done?mac=..`, which
 when that file exists. A failed install has no marker and retries.
 
 ## What `install` does
-apt packages -> (optional netplan static IP) -> free port 53 -> `/etc/dnsmasq.conf` + MAC bindings ->
+apt packages -> (optional netplan static IP) -> free port 53 -> `/etc/dnsmasq.d/pxe.conf` (global `/etc/dnsmasq.conf` is kept, only ensured to load `conf-dir=/etc/dnsmasq.d`) + MAC bindings ->
 netboot image to TFTP root + `grub.cfg` -> copies itself to `/usr/local/sbin/pxe-installer`, writes
 `pxe-ctl` wrapper -> ISO, autoinstall `user-data`, CGI and Apache conf -> start services, ufw rules, checks.
 
