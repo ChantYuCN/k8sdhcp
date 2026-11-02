@@ -59,7 +59,7 @@ exit /b
 
 :check
 set "RESULT=unknown"
-if exist "%~1\MTR_pass.flg" set "RESULT=pass"
-if exist "%~1\MTR_fail.flg" set "RESULT=fail"
+for /r "%~1" %%F in (MTR_pass.flg) do if exist "%%~fF" set "RESULT=pass"
+for /r "%~1" %%F in (MTR_fail.flg) do if exist "%%~fF" set "RESULT=fail"
 >> "%CSV%" echo "%DNAME%","%~nx1","%~1",%RESULT%
 exit /b
