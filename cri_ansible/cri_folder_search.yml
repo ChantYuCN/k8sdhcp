@@ -1,0 +1,72 @@
+# Usage:
+#   ansible-playbook -i inventory.ini cri_folder_search.yml -k \
+#     -e folder_path_A=/data/logs -e fromtime=20261027 -e totime=20261102
+#
+# Layout searched on every server: <folder_path_A>/<yyyymmdd>/WTCI2638SD31*
+# Output (on the controller): cri_folder_search_result.csv
+#   host ip,foldername,folderpath,result
+
+# 1. Ping-pong: every server must be reachable and authenticate, otherwise stop.
+- name: Check all servers are accessible
+  hosts: servers
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Ping-pong
+      ansible.builtin.ping:
+
+# 2 + 3. Search date folders in range, then classify each WTCI2638SD31* folder.
+- name: Search folders on each server
+  hosts: servers
+  gather_facts: false
+  vars:
+    folder_prefix: WTCI2638SD31
+  tasks:
+    - name: Validate arguments
+      ansible.builtin.assert:
+        that:
+          - folder_path_A is defined
+          - fromtime is defined and (fromtime | string) is match('^[0-9]{8}$')
+          - totime is defined and (totime | string) is match('^[0-9]{8}$')
+          - (fromtime | string) <= (totime | string)
+        fail_msg: "Required: -e folder_path_A=/path -e fromtime=yyyymmdd -e totime=yyyymmdd (fromtime <= totime)"
+      run_once: true
+
+    - name: Find WTCI2638SD31* folders in date range and read MTR flags
+      ansible.builtin.shell: |
+        for d in "$FOLDER_A"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]; do
+          [ -d "$d" ] || continue
+          n=$(basename "$d")
+          if [[ "$n" < "$FROM" || "$n" > "$TO" ]]; then continue; fi
+          for f in "$d"/"$PREFIX"*; do
+            [ -d "$f" ] || continue
+            if   [ -e "$f/MTR_fail.flg" ]; then r=fail
+            elif [ -e "$f/MTR_pass.flg" ]; then r=pass
+            else r=unknown; fi
+            printf '%s,"%s","%s",%s\n' "$HOST_IP" "$(basename "$f")" "$f" "$r"
+          done
+        done
+      args:
+        executable: /bin/bash
+      environment:
+        FOLDER_A: "{{ folder_path_A }}"
+        FROM: "{{ fromtime }}"
+        TO: "{{ totime }}"
+        PREFIX: "{{ folder_prefix }}"
+        HOST_IP: "{{ ansible_host | default(inventory_hostname) }}"
+      register: search
+      changed_when: false
+
+# 4. Collect every server's rows into one CSV on the controller.
+- name: Build CSV report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Write cri_folder_search_result.csv
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/cri_folder_search_result.csv"
+        content: |
+          host ip,foldername,folderpath,result
+          {{ (groups['servers'] | map('extract', hostvars, ['search', 'stdout_lines']) | flatten) | join('\n') }}
+        mode: "0644"
