@@ -40,8 +40,8 @@
           if [[ "$n" < "$FROM" || "$n" > "$TO" ]]; then continue; fi
           for f in "$d"/"$PREFIX"*; do
             [ -d "$f" ] || continue
-            if   [ -e "$f/MTR_fail.flg" ]; then r=fail
-            elif [ -e "$f/MTR_pass.flg" ]; then r=pass
+            if   [ -n "$(find "$f" -type f -name MTR_fail.flg -print -quit)" ]; then r=fail
+            elif [ -n "$(find "$f" -type f -name MTR_pass.flg -print -quit)" ]; then r=pass
             else r=unknown; fi
             printf '%s,"%s","%s",%s\n' "$HOST_IP" "$(basename "$f")" "$f" "$r"
           done
