@@ -1,10 +1,11 @@
-# Build a Casper OS Installer and Deploy It with Curtin over PXE
+# Build a Generic Casper OS Installer and Deploy It with Curtin over PXE
 
 ## Purpose and Scope
 
 Capture the existing Ubuntu OS on **source disk `/dev/sda`**, build a bootable
-installer ISO containing that OS, and use PXE to install it automatically onto
-the destination host's **new, empty NVMe disk**.
+generic `cri-installer.iso` containing that OS, and use PXE to install it
+automatically onto multiple approved servers concurrently. Each destination
+must have **exactly one unused, sufficiently large NVMe candidate**.
 
 ```text
 SOURCE / BUILD MACHINE
@@ -45,7 +46,7 @@ solely because it is the largest ext4 partition.
 | `SOURCE_ROOT` | Confirmed root partition on that disk, for example `/dev/sda1` only after inspection |
 | `SOURCE_BOOT` | Optional separate `/boot` partition identified from the source OS's fstab |
 | Source EFI partition | Not copied; Curtin creates and populates a new destination EFI partition |
-| Destination NVMe | A different host's disk, identified by its own by-id path and serial |
+| Destination NVMe | Discovered on each host; no preconfigured disk ID or serial required |
 
 Capture the root filesystem and its kernel/modules, including a separate `/boot`
 if present. Do not copy unrelated data partitions or the source disk's UUIDs and
@@ -66,12 +67,16 @@ of every partition on `/dev/sda`.
 - Use an isolated provisioning VLAN, trusted server, and explicit MAC allowlist.
   HTTP and the existing completion endpoint are not an authenticated deployment
   protocol. Checksums detect corruption, not a malicious replacement ISO.
-- The launcher accepts a pinned `/dev/disk/by-id/` path and matching serial. It
-  refuses disks with partitions, signatures, mounts, swap, or active holders.
-  It does not select the first NVMe automatically or overwrite an existing OS.
-- The sample uses a fixed root size with the remaining space unallocated. It
-  does not require a destination as large as the source `/dev/sda` disk, but
-  the extracted data, filesystem overhead, and working headroom must fit.
+- The launcher discovers whole NVMe namespaces and requires exactly one that
+  passes capacity and usage checks. It excludes disks with partitions,
+  signatures, mounts, swap, or active holders. Zero or multiple candidates
+  stop installation; there is no first-disk or largest-disk fallback.
+- No detectable signature does **not** prove that a disk has no valuable data.
+  Enroll only hosts whose qualifying disk is explicitly approved for erasure.
+  Disconnect storage that must never be written during provisioning.
+- Root size is calculated from the selected disk's capacity, reserving space
+  for a 1 GiB EFI partition and alignment. The disk need not be as large as
+  source `/dev/sda`, but it must meet the payload's minimum root size.
 - The ISO is downloaded into RAM for this HTTP Casper method. RAM must cover
   the entire ISO plus the live OS and Curtin's working memory. Large payloads
   may need a separately served image or NFS design instead.
@@ -287,7 +292,7 @@ apt-get update
 apt-get install -y linux-generic casper curtin systemd-sysv systemd-resolved \
   netplan.io sudo curl ca-certificates rsync squashfs-tools \
   grub-efi-amd64-bin grub-efi-amd64 efibootmgr dosfstools gdisk \
-  iproute2 util-linux kmod
+  iproute2 util-linux kmod jq
 command -v curtin
 curtin version
 mkdir -p /etc/systemd/network /etc/cri
@@ -306,49 +311,43 @@ ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 Do not set `BOOT=nfs`. Casper will be selected by `boot=casper` on the kernel
 command line. Continue with sections 4 and 5 while still in this chroot.
 
-## 4. Define the Destination Profile
+## 4. Use Runtime Discovery Instead of a Destination Profile
 
-First collect these values on the **destination**, booted from a non-installing
-live environment:
+Do not create `/etc/cri/target.conf`. The ISO contains no PXE server address,
+target MAC, hostname, disk ID, or disk serial. Every host runs the same launcher
+and generates its own configuration in its local live environment.
 
-```bash
-lsblk -d -o NAME,SIZE,MODEL,SERIAL
-ls -l /dev/disk/by-id/nvme-*
-ip -br link
-```
+| Value | Runtime source |
+| --- | --- |
+| PXE HTTP origin | The `url=` or `iso-url=` kernel argument supplied by network GRUB |
+| Boot MAC | `cri.pxe_mac=${net_default_mac}`, expanded automatically by GRUB |
+| Provisioning NIC | IPv4 route to the HTTP server, required to match the boot MAC |
+| Destination | Exactly one unused NVMe namespace with enough capacity |
+| Root size | Whole GiB of destination capacity minus 2 GiB, checked against payload minimum |
+| Hostname | `cri-` followed by the full MAC without colons |
+| Completion | Separate `/done/<mac>` marker on the PXE server |
 
-The MAC must be the NIC used for PXE. The serial and by-id path identify the
-destination disk, not the source disk. This recipe embeds one destination
-profile per ISO; a fleet deployment needs a reviewed per-host profile mechanism.
+This example supports a direct **HTTP URL with a literal IPv4 address and
+optional port**, with the ISO and callback on the same server. It rejects
+credentials, query strings, fragments, DNS names, IPv6, and duplicate URL/MAC
+arguments. Adapt and test discovery before using proxies or another topology.
+No downloaded configuration is executed or sourced.
 
-Back **inside the live build chroot**, create this root-owned profile. Leave
-`ALLOW_ERASE=NO` until the manual checks and VM tests are complete. `ROOT_GIB`
-must be at least the value recorded in `payload/min-root-gib`.
-
-```bash
-cat > /etc/cri/target.conf <<'EOF'
-ALLOW_ERASE=NO
-TARGET_DISK='/dev/disk/by-id/nvme-REPLACE_WITH_WHOLE_DISK_ID'
-TARGET_SERIAL='REPLACE_WITH_SERIAL'
-TARGET_MAC='aa:bb:cc:dd:ee:01'
-TARGET_HOSTNAME='cri-node01'
-ROOT_GIB=100
-PXE_SERVER='192.168.5.1'
-EOF
-chmod 600 /etc/cri/target.conf
-```
-
-Serial numbers are identifiers, not secrets. Do not put passwords or tokens on
-the kernel command line. The live ISO and embedded profile must be trusted.
+The PXE server still needs its actual interface, IP/subnet, and enrolled host
+MACs. Those are server-side settings, not ISO contents. The DHCP allowlist and
+the explicit `cri.install=1` boot flag authorize this destructive workflow;
+MACs and kernel flags are not authentication. Use a trusted provisioning VLAN.
+Do not put passwords or tokens on the kernel command line.
 
 ## 5. Add the Guarded Curtin Launcher
 
 Still **inside the live build chroot**, create the following script. It generates
-Curtin YAML from validated profile values; the source is the clean payload, not
-the running live root. It deliberately leaves unused disk space unallocated.
+Curtin YAML from validated runtime values; the source is the clean payload, not
+the running live root. It leaves only the capacity/alignment reserve unallocated.
 
 `--check` performs preflight checks only. `--install` is destructive and also
-requires both `ALLOW_ERASE=YES` and the kernel argument `cri.install=1`.
+requires the kernel argument `cri.install=1`. Diagnostics still require the
+PXE URL and GRUB-supplied MAC so they exercise the same discovery path.
 
 ```bash
 cat > /usr/local/sbin/cri-install <<'SCRIPT'
@@ -362,57 +361,103 @@ mode=${1:---check}
 [[ $mode == --check || $mode == --install ]] || fail 'Use --check or --install'
 exec 9>/run/cri-install.lock
 flock -n 9 || fail 'Another installer is running'
-source /etc/cri/target.conf
+umask 077
 
 [[ -d /sys/firmware/efi ]] || fail 'UEFI boot required'
-[[ $TARGET_DISK =~ ^/dev/disk/by-id/nvme-[A-Za-z0-9._:-]+$ ]] || fail 'Invalid NVMe by-id path'
-[[ $TARGET_DISK != *REPLACE* && $TARGET_SERIAL != *REPLACE* ]] || fail 'Edit the profile first'
+read -r -a boot_args < /proc/cmdline
+iso_urls=()
+boot_macs=()
+install_flags=()
+for argument in "${boot_args[@]}"; do
+  case "$argument" in
+    url=*|iso-url=*) iso_urls+=("${argument#*=}") ;;
+    cri.pxe_mac=*) boot_macs+=("${argument#*=}") ;;
+    cri.install=*) install_flags+=("${argument#*=}") ;;
+  esac
+done
+[[ ${#iso_urls[@]} -eq 1 && ${#boot_macs[@]} -eq 1 ]] || fail 'Require exactly one ISO URL and cri.pxe_mac'
+iso_url=${iso_urls[0]}
+[[ $iso_url =~ ^http://([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:([0-9]{1,5}))?(/[A-Za-z0-9._~/-]+)$ ]] || fail 'Require direct HTTP IPv4 ISO URL'
+PXE_SERVER=${BASH_REMATCH[1]}
+port=${BASH_REMATCH[3]}
+IFS=. read -r -a octets <<< "$PXE_SERVER"
+for octet in "${octets[@]}"; do
+  [[ $octet == 0 || $octet != 0* ]] || fail 'IPv4 octets must not have leading zeros'
+  (( 10#$octet <= 255 )) || fail 'Invalid IPv4 octet'
+done
+PXE_ORIGIN="http://$PXE_SERVER"
+if [[ -n $port ]]; then
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || fail 'Invalid HTTP port'
+  PXE_ORIGIN+=":$port"
+fi
+TARGET_MAC=${boot_macs[0],,}
 [[ $TARGET_MAC =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || fail 'Use a lowercase colon-separated MAC'
-[[ $TARGET_HOSTNAME =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || fail 'Invalid hostname'
-[[ $ROOT_GIB =~ ^[1-9][0-9]{0,5}$ ]] || fail 'Invalid root size'
-[[ $PXE_SERVER =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Use the PXE server IPv4 address'
-
-disk=$(readlink -e "$TARGET_DISK") || fail 'Destination not present'
-[[ $disk =~ ^/dev/nvme[0-9]+n[0-9]+$ && -b $disk ]] || fail 'Not a whole NVMe namespace'
-serial=$(lsblk -dn -o SERIAL "$disk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-[[ -n $serial && $serial == "$TARGET_SERIAL" ]] || fail 'Disk serial mismatch'
-[[ $(lsblk -dn -o RO "$disk") == 0 ]] || fail 'Read-only disk'
-[[ $(lsblk -nrpo NAME "$disk" | wc -l) -eq 1 ]] || fail 'Disk has partitions or dependent devices'
-[[ -z $(lsblk -nrpo MOUNTPOINTS "$disk" | tr -d '[:space:]') ]] || fail 'Disk is mounted'
-[[ -z $(wipefs --no-act --noheadings --output TYPE "$disk") ]] || fail 'Disk has existing signatures'
-for holder in /sys/class/block/"${disk##*/}"/holders/*; do
-    [[ ! -e $holder ]] || fail 'Disk has active holders'
-done
-while read -r swap_device; do
-    [[ $(readlink -f "$swap_device") != "$disk" ]] || fail 'Disk is active swap'
-done < <(swapon --show=NAME --noheadings --raw)
-
-iface=''
-for address_file in /sys/class/net/*/address; do
-    if [[ $(cat "$address_file") == "$TARGET_MAC" ]]; then
-        [[ -z $iface ]] || fail 'More than one interface matches the MAC'
-        iface=${address_file%/address}
-        iface=${iface##*/}
-    fi
-done
-[[ -n $iface ]] || fail 'Expected PXE NIC not present'
+TARGET_HOSTNAME="cri-${TARGET_MAC//:/}"
+iface=$(ip -4 -j route get "$PXE_SERVER" | jq -er 'if length == 1 then .[0].dev // empty else empty end') || fail 'No unique route to PXE server'
+[[ $iface =~ ^[A-Za-z0-9_.:-]{1,15}$ && -f /sys/class/net/$iface/address ]] || fail 'Invalid provisioning NIC'
+[[ $(cat "/sys/class/net/$iface/address") == "$TARGET_MAC" ]] || fail 'Route NIC does not match GRUB boot MAC'
 
 media=/cdrom/payload
 [[ -f $media/os.squashfs && -f $media/SHA256SUMS ]] || fail 'Payload not mounted under /cdrom/payload'
 (cd "$media" && sha256sum --check SHA256SUMS) || fail 'Payload checksum failed'
 min_root_gib=$(cat "$media/min-root-gib")
 [[ $min_root_gib =~ ^[1-9][0-9]{0,5}$ ]] || fail 'Invalid minimum root size'
-(( ROOT_GIB >= min_root_gib )) || fail 'Root filesystem would be too small'
-disk_bytes=$(blockdev --getsize64 "$disk")
-(( disk_bytes >= (ROOT_GIB + 2) * 1073741824 )) || fail 'Destination capacity insufficient'
-curl --fail --silent --show-error --max-time 15 --interface "$iface" \
-    "http://$PXE_SERVER/iso/cri-ready.txt" >/dev/null || fail 'PXE HTTP server unreachable on selected NIC'
 
-printf 'Destination: %s\nSerial: %s\nMAC: %s\nRoot: %s GiB\n' \
-    "$disk" "$serial" "$TARGET_MAC" "$ROOT_GIB"
+eligible_disk() {
+  local candidate=$1 value holder swap_device swap_path swaps
+  [[ -b $candidate ]] || return 1
+  value=$(lsblk -dn -o TYPE "$candidate") || fail 'Cannot read disk type'
+  [[ $value == disk ]] || return 1
+  value=$(lsblk -dn -o RO "$candidate") || fail 'Cannot read disk write protection'
+  [[ $value == 0 ]] || return 1
+  value=$(lsblk -nrpo NAME "$candidate") || fail 'Cannot inspect disk children'
+  [[ $value == "$candidate" ]] || return 1
+  value=$(lsblk -nrpo MOUNTPOINTS "$candidate") || fail 'Cannot inspect mounts'
+  [[ -z ${value//[[:space:]]/} ]] || return 1
+  value=$(wipefs --no-act --noheadings --output TYPE "$candidate") || fail 'Cannot inspect signatures'
+  [[ -z $value ]] || return 1
+  for holder in /sys/class/block/"${candidate##*/}"/holders/*; do
+    [[ ! -e $holder && ! -L $holder ]] || return 1
+  done
+  swaps=$(swapon --show=NAME --noheadings --raw) || fail 'Cannot inspect swap'
+  while IFS= read -r swap_device; do
+    [[ -n $swap_device ]] || continue
+    swap_path=$(readlink -f "$swap_device") || fail 'Cannot resolve swap device'
+    [[ $swap_path != "$candidate" ]] || return 1
+  done <<< "$swaps"
+  value=$(blockdev --getsize64 "$candidate") || fail 'Cannot read disk capacity'
+  [[ $value =~ ^[1-9][0-9]*$ ]] || fail 'Invalid disk capacity'
+  (( value / 1073741824 - 2 >= min_root_gib ))
+}
+
+discover_disks() {
+  local candidate
+  candidates=()
+  for candidate in /dev/nvme*n*; do
+    [[ $candidate =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || continue
+    if eligible_disk "$candidate"; then
+      candidates+=("$candidate")
+    else
+      echo "Excluded NVMe: $candidate (in use, non-empty, or too small)" >&2
+    fi
+  done
+  [[ ${#candidates[@]} -eq 1 ]] || fail "Expected exactly one eligible NVMe; found ${#candidates[@]}"
+}
+
+udevadm settle --timeout=30 || fail 'Device discovery did not settle'
+discover_disks
+disk=${candidates[0]}
+disk_identity=$(lsblk -bdn -o MAJ:MIN,SIZE,MODEL,SERIAL,WWN "$disk") || fail 'Cannot record disk identity'
+disk_bytes=$(blockdev --getsize64 "$disk") || fail 'Cannot read disk capacity'
+ROOT_GIB=$(( disk_bytes / 1073741824 - 2 ))
+ready=$(curl --noproxy '*' --fail --silent --show-error --max-time 15 --interface "$iface" \
+  "$PXE_ORIGIN/iso/cri-ready.txt") || fail 'PXE HTTP server unreachable on selected NIC'
+[[ $ready == ready ]] || fail 'Unexpected readiness response'
+
+printf 'Server: %s\nNIC: %s\nMAC: %s\nHostname: %s\nDestination: %s\nIdentity: %s\nRoot: %s GiB\n' \
+  "$PXE_ORIGIN" "$iface" "$TARGET_MAC" "$TARGET_HOSTNAME" "$disk" "$disk_identity" "$ROOT_GIB"
 [[ $mode == --install ]] || { echo 'Preflight passed; no disk writes performed'; exit 0; }
-[[ $ALLOW_ERASE == YES ]] || fail 'ALLOW_ERASE is not YES'
-grep -Eq '(^|[[:space:]])cri.install=1([[:space:]]|$)' /proc/cmdline || fail 'Installation not armed at boot'
+[[ ${#install_flags[@]} -eq 1 && ${install_flags[0]} == 1 ]] || fail 'Installation not armed exactly once at boot'
 [[ ! -e /run/cri-install.attempted ]] || fail 'Already attempted this boot; inspect logs'
 touch /run/cri-install.attempted
 
@@ -437,7 +482,7 @@ storage:
   config:
     - id: destination
       type: disk
-      path: '$TARGET_DISK'
+      path: '$disk'
       ptable: gpt
       wipe: superblock-recursive
       grub_device: true
@@ -451,21 +496,31 @@ late_commands:
   10-customize: ['/usr/local/sbin/cri-customize', '$TARGET_HOSTNAME', '$TARGET_MAC']
 EOF
 
+udevadm settle --timeout=30 || fail 'Device discovery did not settle'
+discover_disks
+[[ ${candidates[0]} == "$disk" ]] || fail 'Selected disk changed'
+current_identity=$(lsblk -bdn -o MAJ:MIN,SIZE,MODEL,SERIAL,WWN "$disk") || fail 'Cannot recheck disk identity'
+[[ $current_identity == "$disk_identity" ]] || fail 'Disk identity changed'
 curtin -c /run/cri-curtin.yaml install
 touch /run/cri-install.succeeded
 sync
-curl --fail --silent --show-error --max-time 30 --retry 3 --interface "$iface" \
-    "http://$PXE_SERVER/cgi-bin/pxe-done?mac=$TARGET_MAC"
+reply=$(curl --noproxy '*' --fail --silent --show-error --max-time 30 --retry 3 --interface "$iface" \
+  "$PXE_ORIGIN/cgi-bin/pxe-done?mac=$TARGET_MAC") || fail 'Installed, but callback failed; do not reinstall'
+[[ $reply == "ok $TARGET_MAC" ]] || fail 'Installed, but completion acknowledgment invalid; do not reinstall'
 echo 'Installation completed and PXE server notified; rebooting'
 systemctl reboot
 SCRIPT
 chmod 755 /usr/local/sbin/cri-install
 ```
 
-The by-id path is passed to Curtin only after the serial check. Do not hotplug
-storage during installation. A failed install normally leaves signatures and
-will be refused on subsequent boots; it is not automatically erased and retried.
-Do not remove these safeguards to handle failures. Diagnose first.
+No operator-supplied serial is needed. The launcher records the discovered disk
+identity and repeats selection and identity checks immediately before Curtin.
+Do not hotplug storage during installation; these checks cannot make hotplug
+race-free. Existing SATA/SAS disks are never candidates. Existing NVMe contents
+are excluded, not erased. A partial install normally leaves signatures and is
+not automatically erased and retried. Diagnose failures instead of bypassing
+the guards. Hardware RAID, multipath, NVMe-oF, and SAN storage need a separate
+reviewed selection policy; this recipe is for directly attached NVMe.
 
 Add the target customization helper in the same **live chroot**. It is run by
 Curtin's late stage, where `TARGET_MOUNT_POINT` is defined. Errors abort success.
@@ -533,7 +588,6 @@ Description=Install captured CRI OS with Curtin
 Wants=network-online.target
 After=network-online.target
 ConditionKernelCommandLine=cri.install=1
-ConditionPathExists=/etc/cri/target.conf
 
 [Service]
 Type=oneshot
@@ -588,20 +642,17 @@ menuentry "CRI live diagnostics (no installation)" {
   linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp ---
     initrd /casper/initrd
 }
-menuentry "Install CRI to the approved empty NVMe (ERASES DISK)" {
-  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp cri.install=1 ---
-    initrd /casper/initrd
-}
 EOF
 
 grub-mkrescue -o "$WORK/cri-installer.iso" "$ISO" -- -volid CRI_INSTALLER
 sha256sum "$WORK/cri-installer.iso"
 ```
 
-This ISO defaults to diagnostics. The install entry still refuses to write until
-the embedded profile is approved with `ALLOW_ERASE=YES`. For each rebuild, use
-a new output path or deliberately replace only the generated SquashFS outputs;
-do not append new content to an old filesystem image.
+The ISO's local USB/BMC menu is diagnostics-only: it has no PXE URL or boot MAC.
+Use the network GRUB menu below for preflight and installation. This keeps the
+ISO generic without embedding a server address for local-media installation.
+For each rebuild, use a new output path or deliberately replace only generated
+SquashFS outputs; do not append new content to an old filesystem image.
 
 The boot kernel/initrd above are from the **live installer**, not the captured
 OS. The payload retains its own installed kernel for booting the finished system.
@@ -624,7 +675,9 @@ umask 077
 ./target/release/pxe-installer print-config > pxe.conf
 ```
 
-Edit `pxe.conf` with the actual interface, subnet, and target MAC. For example:
+Edit `pxe.conf` with the actual interface, subnet, and each approved target MAC.
+These addresses are examples for the **PXE server only**, not values embedded
+in the ISO. Use distinct DHCP addresses and globally unique NIC MACs:
 
 ```ini
 IFACE=enp2s0
@@ -635,9 +688,14 @@ DHCP_END=192.168.5.200
 SET_STATIC_IP=1
 ONLY_KNOWN_HOSTS=1
 HOST=aa:bb:cc:dd:ee:01,192.168.5.101,cri-node01
+HOST=aa:bb:cc:dd:ee:02,192.168.5.102,cri-node02
 TARGET_PASSWORD=REPLACE_WITH_A_STRONG_LOCAL_VALUE
 ISO_NAME=cri-installer.iso
 ```
+
+The `HOST` names are DHCP labels; the installed hostname is derived from the
+MAC, for example `cri-aabbccddee01`. Add enrolled hosts on the server without
+rebuilding the ISO. Never remove the allowlist merely to make deployment easier.
 
 The existing CLI still requires a target password to generate its unrelated
 Ubuntu Server seed. That password does **not** change the users/passwords inside
@@ -681,30 +739,34 @@ printf 'ready\n' | sudo tee /var/www/html/iso/cri-ready.txt >/dev/null
 ```
 
 On the PXE server, replace `/var/lib/tftpboot/grub/grub.cfg` with the following.
-Replace the sample MAC in **both** the profile and menu with the actual target.
-Initially keep `default=0` (diagnostics). No Ubuntu `autoinstall` or NoCloud seed
-arguments are needed: the custom live system launches Curtin itself.
+Initially keep `default=0` (diagnostics). GRUB obtains the TFTP server address
+from `net_default_server` and passes its boot MAC automatically. This assumes
+TFTP, HTTP, and the completion CGI are on the same IPv4 server, as in this
+project. For a non-default HTTP port, change only `cri_iso_url` in this
+**server-side menu**, not the ISO. Separate HTTP/TFTP hosts need an adapted
+callback and shared completion-marker arrangement; changing the URL alone
+is not sufficient. No Ubuntu `autoinstall` or NoCloud seed arguments are needed:
+the custom live system launches Curtin itself.
 
 ```grub
 set timeout=10
 set default=0
+set cri_iso_url="http://${net_default_server}/iso/cri-installer.iso"
+set cri_pxe_mac="${net_default_mac}"
+export cri_iso_url
+export cri_pxe_mac
 
 if [ -f /done/${net_default_mac} ]; then
     echo "Installation already recorded; leaving PXE."
     exit
 fi
 
-if [ "${net_default_mac}" != "aa:bb:cc:dd:ee:01" ]; then
-    echo "This image is not authorized for this MAC."
-    exit
-fi
-
 menuentry "CRI live diagnostics (no installation)" {
-  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=http://192.168.5.1/iso/cri-installer.iso ---
+  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=${cri_iso_url} cri.pxe_mac=${cri_pxe_mac} ---
     initrd /casper/initrd
 }
 menuentry "Install CRI to approved empty NVMe (ERASES DISK)" {
-  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=http://192.168.5.1/iso/cri-installer.iso cri.install=1 ---
+  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=${cri_iso_url} cri.pxe_mac=${cri_pxe_mac} cri.install=1 ---
     initrd /casper/initrd
 }
 ```
@@ -739,42 +801,73 @@ network, including TFTP connection tracking where required.
 
 ### VM Test
 
-Use a disposable VM with an OVMF UEFI firmware, Secure Boot off, a virtual NVMe
-disk with a known serial, and a NIC with a fixed MAC. Give it enough RAM for the
-ISO and installer. Build a VM-specific profile; do not reuse real-server disk
-identifiers. The VM must reach the PXE host on its configured IP; use an isolated
-bridged test network when testing DHCP/TFTP.
+Use disposable VMs with OVMF UEFI firmware, Secure Boot off, virtual NVMe disks,
+and distinct fixed NIC MACs enrolled in the server allowlist. Give each enough
+RAM for the ISO and installer. No VM-specific profile or serial is required.
+Use an isolated bridged test network when testing DHCP/TFTP.
 
-1. Boot the ISO diagnostic entry first. Verify Casper reaches a shell.
+1. Boot the local ISO diagnostic entry first to verify Casper reaches a shell,
+   then PXE-boot the network diagnostic entry for runtime discovery tests.
 2. Check `/cdrom/payload`, `cat /proc/cmdline`, NIC addressing, and repository
    access. A readiness URL alone does not prove target APT repositories work.
 3. Run `sudo /usr/local/sbin/cri-install --check`. This checks metadata and
    hashes but does not invoke Curtin or write to the destination disk.
-4. Test wrong serial, wrong MAC, missing payload, corrupted payload, insufficient
-   capacity, and a disk with an existing partition. Every case must stop.
-5. Set `ALLOW_ERASE=YES` in the live staging profile, rebuild the live SquashFS
-   and ISO, then select the install entry manually on a fresh disposable disk.
+4. Test zero candidates, two eligible NVMes, insufficient capacity, partitions,
+  filesystem/RAID/LVM signatures, mounts, swap, and holders. Used disks must
+  never qualify; zero or multiple eligible disks must stop. Test missing or
+  duplicate URL/MAC arguments, malformed URLs, a route-NIC/MAC mismatch,
+  missing/corrupt payload, and unreachable HTTP. Each invalid case must stop.
+5. Select the PXE install entry manually on one fresh disposable disk. No ISO
+  rebuild or embedded erase switch is needed; `cri.install=1` arms this boot.
 6. Observe Curtin and check the completion marker on the PXE server.
 7. Disconnect ISO/PXE and boot the virtual NVMe. Verify EFI boot, root UUID,
    hostname, DHCP, SSH access, unique host keys, and the actual CRI applications.
 8. Re-enable PXE and verify the done guard and disk-signature checks prevent
    another installation. Failure recovery must not silently wipe again.
+9. Boot two enrolled VMs concurrently using the same ISO. Verify different
+   generated hostnames, SSH host keys, machine IDs after first boot, and done
+   markers. One completed client must not suppress another client's install.
+10. Interrupt an installation and separately simulate callback failure. Confirm
+  neither automatically wipes again and callback failure prevents reboot.
+11. Change the PXE server IP and corresponding DHCP/server settings in the test
+  network, reapply the custom menu, and use the unchanged ISO. Verify the new
+  origin and matching NIC are discovered, including on multi-NIC hosts.
 
 ### Enable Automatic PXE Installation
 
 Only after those tests pass:
 
-1. Build an ISO containing the approved destination profile with `ALLOW_ERASE=YES`.
+1. Build and test the generic ISO once; approve each host and its eligible disk
+  for erasure, then enroll its MAC on the PXE server.
 2. Replace the served ISO and matching live kernel/initrd as one deployment
    while target machines are not booting. Verify their checksums after transfer.
 3. Set `default=1` in the **PXE server's custom GRUB menu**, selecting the install
    entry after the timeout. Keep the MAC allowlist and done guard.
-4. Boot the approved server using UEFI PXE IPv4. No interactive confirmation
-   follows once the explicit profile and boot entry authorize installation.
+4. Boot approved servers using UEFI PXE IPv4. No interactive confirmation
+  follows once the install entry is selected and runtime guards pass.
 5. Confirm local disk boot after the installer reports success.
 
-The ISO's own GRUB default is independent of the network GRUB default. A USB or
-BMC-mounted copy still defaults to diagnostics unless you deliberately change it.
+The ISO's own menu is independent of the network menu and remains diagnostics-only.
+
+### Reuse and Concurrent Deployment
+
+When migrating from the earlier per-host recipe, remove the old
+`/etc/cri/target.conf` from the **live staging tree**, replace the launcher and
+service, and install `jq` there. Rebuild the live SquashFS and ISO once using
+section 6, and deploy the matching live kernel/initrd together. Reuse the
+existing payload if the captured OS has not changed; do not recapture `/dev/sda`
+just because target machines or the PXE server address changed.
+
+After that one-time rebuild, a new host needs only server-side enrollment. A
+new subnet requires updated server/DHCP/firewall settings, not another ISO.
+Reapply the custom menu after `start` or `pxe-ctl grub`. Do not replace served
+boot assets or the ISO while clients are downloading them.
+
+Each host has independent `/run/cri-curtin.yaml`, installation state, and logs
+in its live environment; only the read-only ISO is shared. Completion is keyed
+by the boot MAC. Each client downloads the entire ISO, so provision sufficient
+RAM per host and HTTP bandwidth/storage throughput for the batch. Stagger
+boots when necessary; this recipe does not provide multicast distribution.
 
 ## 9. Logs, Recovery, and Troubleshooting
 
@@ -801,11 +894,12 @@ sudo pxe-ctl status
 | Initramfs asks for `root=` | Check `/proc/cmdline` for `boot=casper` and `/scripts/casper` in initramfs. Do not point `root=` at the source disk. |
 | Casper cannot find live media | Check the ISO URL, matching live kernel/initrd, Casper scripts, NIC support, RAM, and `/casper/filesystem.squashfs` inside the ISO. |
 | `/cdrom/payload` missing | Inspect actual media mounts and ISO contents before adjusting the launcher and Curtin source together. |
-| Installer did not start | Diagnostic entry intentionally lacks `cri.install=1`; inspect systemd status and the embedded profile. |
-| Destination refused | Wrong identity, insufficient size, existing signatures, active usage, or an earlier partial installation. Do not bypass the guard without a separate erase review. |
+| Installer did not start | Diagnostic entry intentionally lacks `cri.install=1`; inspect systemd status and the kernel arguments. |
+| URL or NIC refused | Require one HTTP IPv4 ISO URL and one GRUB-supplied `cri.pxe_mac`; the route to that server must use the same physical NIC. Local ISO boot alone does not supply these. |
+| Destination refused | Zero/multiple eligible NVMes, insufficient size, existing signatures, active usage, or an earlier partial installation. Do not bypass the guard without a separate erase review. |
 | Curtin fails in curthooks | Check source Ubuntu compatibility, APT/DNS/routing, installed kernel/modules, bootloader packages, and UEFI variables. |
 | Installed OS has no network | Check its generated Netplan configuration, selected MAC, networkd/resolved services, and destination gateway. |
-| PXE starts again after success | Check UEFI boot order and `/var/lib/tftpboot/done/<mac>`; ensure profile MAC equals GRUB's PXE MAC. |
+| PXE starts again after success | Check UEFI boot order and `/var/lib/tftpboot/done/<mac>`; compare the logged runtime MAC with GRUB's PXE MAC. |
 
 If Curtin succeeded but the callback failed, the service stops without rebooting.
 Do **not** rerun the installation. Verify the success log and
@@ -829,7 +923,7 @@ will not clear existing partitions simply because the marker was removed.
 - [Curtin stages and target environment](https://curtin.readthedocs.io/en/latest/topics/overview.html)
 
 Before production, record the actual source release, live kernel, Casper/Curtin
-package versions, payload hash, profile identity, destination firmware, and VM
+package versions, payload hash, discovered disk identity and MAC, destination firmware, and VM
 test results. Linux image building, UEFI boot, and disk installation must be
 validated on your Linux test environment; documentation syntax checks alone
 cannot establish that the deployment works on your hardware.
