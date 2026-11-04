@@ -229,7 +229,8 @@ mod tests {
         let mut c = cfg();
         c.auto_install = false;
         assert!(grub_cfg(&c).contains("set default=0"));
-        assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/"));
+        // the CRI launcher runs Curtin itself: no Ubuntu autoinstall/NoCloud seed arguments
+        assert!(!s.contains("autoinstall") && !s.contains("nocloud"));
         assert!(!s.contains('@'));
     }
 
