@@ -17,7 +17,7 @@ PXE SERVER
   Serve UEFI boot files + live kernel/initrd over TFTP, installer ISO over HTTP
 
 DESTINATION HOST
-  UEFI PXE -> GRUB -> Casper downloads installer ISO -> guarded Curtin launcher
+  UEFI PXE -> GRUB -> Casper mounts the ISO over NFS -> guarded Curtin launcher
            -> partition approved NVMe -> extract captured OS -> configure GRUB
            -> notify PXE server -> reboot into the installed OS
 ```
@@ -308,8 +308,9 @@ rm -f /etc/resolv.conf
 ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 ```
 
-Do not set `BOOT=nfs`. Casper will be selected by `boot=casper` on the kernel
-command line. Continue with sections 4 and 5 while still in this chroot.
+Do not set `BOOT=nfs` in the initramfs config. Casper is selected by `boot=casper` and
+booted from NFS by the kernel arguments `netboot=nfs nfsroot=...` (section 7); it mounts the
+exported ISO on `/cdrom`, so `/cdrom/payload` exists without downloading the ISO. Continue with sections 4 and 5 while still in this chroot.
 
 ## 4. Use Runtime Discovery Instead of a Destination Profile
 
@@ -319,7 +320,7 @@ and generates its own configuration in its local live environment.
 
 | Value | Runtime source |
 | --- | --- |
-| PXE HTTP origin | The `url=` or `iso-url=` kernel argument supplied by network GRUB |
+| PXE HTTP origin | The `cri.url=` kernel argument supplied by network GRUB (not `url=`: that would make casper download the ISO into RAM) |
 | Boot MAC | `cri.pxe_mac=${net_default_mac}`, expanded automatically by GRUB |
 | Provisioning NIC | IPv4 route to the HTTP server, required to match the boot MAC |
 | Destination | Exactly one unused NVMe namespace with enough capacity |
@@ -370,7 +371,7 @@ boot_macs=()
 install_flags=()
 for argument in "${boot_args[@]}"; do
   case "$argument" in
-    url=*|iso-url=*) iso_urls+=("${argument#*=}") ;;
+    cri.url=*) iso_urls+=("${argument#*=}") ;;
     cri.pxe_mac=*) boot_macs+=("${argument#*=}") ;;
     cri.install=*) install_flags+=("${argument#*=}") ;;
   esac
@@ -627,6 +628,8 @@ kernel_version=${kernel_file##*/vmlinuz-}
 test -d "$LIVE/lib/modules/$kernel_version"
 test -f "$LIVE/boot/initrd.img-$kernel_version"
 lsinitramfs "$LIVE/boot/initrd.img-$kernel_version" | grep 'scripts/casper'
+# NFS boot needs the NFS client in the initrd (klibc nfsmount + nfs modules)
+lsinitramfs "$LIVE/boot/initrd.img-$kernel_version" | grep -E 'bin/nfsmount|kernel/fs/nfs/nfs\.ko'
 cp "$kernel_file" "$ISO/casper/vmlinuz"
 cp "$LIVE/boot/initrd.img-$kernel_version" "$ISO/casper/initrd"
 mksquashfs "$LIVE" "$ISO/casper/filesystem.squashfs" -noappend -comp xz
@@ -738,43 +741,38 @@ sudo pxe-ctl grub
 printf 'ready\n' | sudo tee /var/www/html/iso/cri-ready.txt >/dev/null
 ```
 
-On the PXE server, replace `/var/lib/tftpboot/grub/grub.cfg` with the following.
-Initially keep `default=0` (diagnostics). GRUB obtains the TFTP server address
-from `net_default_server` and passes its boot MAC automatically. This assumes
-TFTP, HTTP, and the completion CGI are on the same IPv4 server, as in this
-project. For a non-default HTTP port, change only `cri_iso_url` in this
-**server-side menu**, not the ISO. Separate HTTP/TFTP hosts need an adapted
-callback and shared completion-marker arrangement; changing the URL alone
-is not sufficient. No Ubuntu `autoinstall` or NoCloud seed arguments are needed:
-the custom live system launches Curtin itself.
+`pxe-installer start` and `pxe-ctl grub` now generate this menu themselves
+(`src/render.rs`), so nothing overwrites it. Do not hand-edit
+`/var/lib/tftpboot/grub/grub.cfg`. The generated menu has three entries:
 
 ```grub
-set timeout=10
-set default=0
-set cri_iso_url="http://${net_default_server}/iso/cri-installer.iso"
-set cri_pxe_mac="${net_default_mac}"
-export cri_iso_url
-export cri_pxe_mac
-
-if [ -f /done/${net_default_mac} ]; then
-    echo "Installation already recorded; leaving PXE."
-    exit
-fi
-
 menuentry "CRI live diagnostics (no installation)" {
-  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=${cri_iso_url} cri.pxe_mac=${cri_pxe_mac} ---
-    initrd /casper/initrd
+  linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=<server>:/srv/nfs/iso ip=dhcp ignore_uuid noprompt video=1920x1080@60 rw cri.url=http://<server>/iso/cri-installer.iso cri.pxe_mac=${net_default_mac} ---
+  initrd /casper/initrd
 }
-menuentry "Install CRI to approved empty NVMe (ERASES DISK)" {
-  linux /casper/vmlinuz boot=casper ignore_uuid noprompt ip=dhcp url=${cri_iso_url} cri.pxe_mac=${cri_pxe_mac} cri.install=1 ---
-    initrd /casper/initrd
+menuentry "Install CRI to the approved empty NVMe (ERASES THE DISK)" {
+  (same line plus cri.install=1)
 }
+menuentry "Boot from local disk" { exit }
 ```
 
-**Important:** `pxe-installer start` and `pxe-ctl grub` regenerate the original
-Ubuntu Server menu from `src/render.rs`. They overwrite this custom menu. Keep
-an administrator-owned copy outside the TFTP tree and reapply it after those
-commands. No Rust source change is required for this documented manual setup.
+- `netboot=nfs nfsroot=` makes casper mount the loop-mounted ISO from the PXE server's NFS
+  export on `/cdrom`. Nothing is copied into RAM, so the ISO size no longer has to fit
+  in the target's memory.
+- There is deliberately no `url=`: casper would download the whole ISO into RAM too.
+  The launcher reads the server origin from `cri.url=` instead (section 5).
+- `video=1920x1080@60` sets the console mode on every KMS connector. To target one
+  connector use `video=HDMI-A-1:1920x1080@60` (see `/sys/class/drm/*/status`).
+- `rw` is the kernel's root-mount flag. The live root is already a writable overlay;
+  the NFS ISO on `/cdrom` stays read-only (it is exported `ro`, which is what you want).
+- `AUTO_INSTALL=1` (default in `pxe.conf`) makes the install entry the default after the
+  5 s timeout; `AUTO_INSTALL=0` defaults to diagnostics. The MAC allowlist and the
+  `/done/<mac>` guard still apply.
+
+On the server `start` also installs `nfs-kernel-server`, loop-mounts
+`/var/www/html/iso/cri-installer.iso` on `/srv/nfs/iso` (an `/etc/fstab` line), and exports
+it read-only to the PXE subnet (`/etc/exports.d/pxe-installer.exports`, mountd pinned to
+port 20048). After replacing the ISO run `sudo pxe-ctl nfs`.
 
 UEFI `exit` does not guarantee local boot on every firmware. Verify that the
 installed Ubuntu boot entry exists and is ahead of PXE, or use one-time PXE boot
@@ -785,7 +783,9 @@ Check service health and readability without marking a real target done:
 
 ```bash
 sudo dnsmasq --test
-sudo systemctl status dnsmasq apache2 --no-pager
+sudo systemctl status dnsmasq apache2 nfs-server --no-pager
+exportfs -v     # /srv/nfs/iso must be exported ro
+showmount -e 127.0.0.1
 curl -fI http://192.168.5.1/iso/cri-installer.iso
 curl -f http://192.168.5.1/iso/cri-ready.txt
 curl -i 'http://192.168.5.1/cgi-bin/pxe-done?mac=bad'
@@ -794,7 +794,7 @@ sudo pxe-ctl status
 
 The last HTTP request should reject the invalid MAC. Never test that endpoint
 using the real MAC before installation: a successful request marks it installed.
-Confirm UDP 67/69, TCP/UDP 53, and TCP 80 are permitted on the provisioning
+Confirm UDP 67/69, TCP/UDP 53, TCP 80, and NFS (TCP/UDP 111, 2049, 20048) are permitted on the provisioning
 network, including TFTP connection tracking where required.
 
 ## 8. Test Before Enabling Unattended Installation
@@ -860,13 +860,14 @@ just because target machines or the PXE server address changed.
 
 After that one-time rebuild, a new host needs only server-side enrollment. A
 new subnet requires updated server/DHCP/firewall settings, not another ISO.
-Reapply the custom menu after `start` or `pxe-ctl grub`. Do not replace served
+The menu is regenerated by `start` and `pxe-ctl grub`; run `pxe-ctl nfs` after replacing the ISO. Do not replace served
 boot assets or the ISO while clients are downloading them.
 
 Each host has independent `/run/cri-curtin.yaml`, installation state, and logs
 in its live environment; only the read-only ISO is shared. Completion is keyed
-by the boot MAC. Each client downloads the entire ISO, so provision sufficient
-RAM per host and HTTP bandwidth/storage throughput for the batch. Stagger
+by the boot MAC. Clients read the ISO over NFS on demand instead of downloading it, so
+RAM per host only has to hold the live system; size the server's disk and NFS/network
+throughput for the batch. Stagger
 boots when necessary; this recipe does not provide multicast distribution.
 
 ## 9. Logs, Recovery, and Troubleshooting
