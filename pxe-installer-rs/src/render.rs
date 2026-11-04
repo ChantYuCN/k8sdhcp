@@ -231,7 +231,8 @@ mod tests {
         assert!(grub_cfg(&c).contains("set default=0"));
         // the CRI launcher runs Curtin itself: no Ubuntu autoinstall/NoCloud seed arguments
         assert!(!s.contains("autoinstall") && !s.contains("nocloud"));
-        assert!(!s.contains('@'));
+        // no unreplaced @PLACEHOLDER@ (the only literal '@' is the refresh rate in video=...@60)
+        assert!(!s.replace("1920x1080@60", "").contains('@'));
     }
 
     #[test]
