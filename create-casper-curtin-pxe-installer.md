@@ -5,7 +5,7 @@
 Capture the existing Ubuntu OS on **source disk `/dev/sda`**, build a bootable
 generic `cri-installer.iso` containing that OS, and use PXE to install it
 automatically onto multiple approved servers concurrently. Each destination
-must have **exactly one unused, sufficiently large NVMe candidate**.
+must have **`/dev/nvme0n1` with enough capacity; it is erased whatever it contains**.
 
 ```text
 SOURCE / BUILD MACHINE
@@ -46,7 +46,7 @@ solely because it is the largest ext4 partition.
 | `SOURCE_ROOT` | Confirmed root partition on that disk, for example `/dev/sda1` only after inspection |
 | `SOURCE_BOOT` | Optional separate `/boot` partition identified from the source OS's fstab |
 | Source EFI partition | Not copied; Curtin creates and populates a new destination EFI partition |
-| Destination NVMe | Discovered on each host; no preconfigured disk ID or serial required |
+| Destination NVMe | Always `/dev/nvme0n1`; erased regardless of its contents |
 
 Capture the root filesystem and its kernel/modules, including a separate `/boot`
 if present. Do not copy unrelated data partitions or the source disk's UUIDs and
@@ -67,13 +67,16 @@ of every partition on `/dev/sda`.
 - Use an isolated provisioning VLAN, trusted server, and explicit MAC allowlist.
   HTTP and the existing completion endpoint are not an authenticated deployment
   protocol. Checksums detect corruption, not a malicious replacement ISO.
-- The launcher discovers whole NVMe namespaces and requires exactly one that
-  passes capacity and usage checks. It excludes disks with partitions,
-  signatures, mounts, swap, or active holders. Zero or multiple candidates
-  stop installation; there is no first-disk or largest-disk fallback.
-- No detectable signature does **not** prove that a disk has no valuable data.
-  Enroll only hosts whose qualifying disk is explicitly approved for erasure.
-  Disconnect storage that must never be written during provisioning.
+- The launcher installs to **`/dev/nvme0n1`** if that whole disk exists, is
+  writable and is large enough. Its current contents (partitions, filesystems,
+  RAID/LVM, swap, data) are **not checked and are destroyed**. Other NVMe disks
+  and all SATA/SAS disks are never touched. If `/dev/nvme0n1` is missing, read-only
+  or too small, installation stops.
+- Because contents are ignored, a host that PXE-boots with the install entry
+  and no `/done/<mac>` marker is wiped and reinstalled, even if it holds valuable
+  data or an earlier install. Enroll only hosts whose `/dev/nvme0n1` is approved
+  for erasure, and disconnect any NVMe that must survive: NVMe enumeration order
+  is not guaranteed to keep `nvme0n1` the same physical drive.
 - Root size is calculated from the selected disk's capacity, reserving space
   for a 1 GiB EFI partition and alignment. The disk need not be as large as
   source `/dev/sda`, but it must meet the payload's minimum root size.
@@ -323,7 +326,7 @@ and generates its own configuration in its local live environment.
 | PXE HTTP origin | The `cri.url=` kernel argument supplied by network GRUB (not `url=`: that would make casper download the ISO into RAM) |
 | Boot MAC | `cri.pxe_mac=${net_default_mac}`, expanded automatically by GRUB |
 | Provisioning NIC | IPv4 route to the HTTP server, required to match the boot MAC |
-| Destination | Exactly one unused NVMe namespace with enough capacity |
+| Destination | `/dev/nvme0n1`, if it exists and has enough capacity (contents ignored) |
 | Root size | Whole GiB of destination capacity minus 2 GiB, checked against payload minimum |
 | Hostname | `cri-` followed by the full MAC without colons |
 | Completion | Separate `/done/<mac>` marker on the PXE server |
@@ -404,50 +407,24 @@ media=/cdrom/payload
 min_root_gib=$(cat "$media/min-root-gib")
 [[ $min_root_gib =~ ^[1-9][0-9]{0,5}$ ]] || fail 'Invalid minimum root size'
 
-eligible_disk() {
-  local candidate=$1 value holder swap_device swap_path swaps
-  [[ -b $candidate ]] || return 1
-  value=$(lsblk -dn -o TYPE "$candidate") || fail 'Cannot read disk type'
-  [[ $value == disk ]] || return 1
-  value=$(lsblk -dn -o RO "$candidate") || fail 'Cannot read disk write protection'
-  [[ $value == 0 ]] || return 1
-  value=$(lsblk -nrpo NAME "$candidate") || fail 'Cannot inspect disk children'
-  [[ $value == "$candidate" ]] || return 1
-  value=$(lsblk -nrpo MOUNTPOINTS "$candidate") || fail 'Cannot inspect mounts'
-  [[ -z ${value//[[:space:]]/} ]] || return 1
-  value=$(wipefs --no-act --noheadings --output TYPE "$candidate") || fail 'Cannot inspect signatures'
-  [[ -z $value ]] || return 1
-  for holder in /sys/class/block/"${candidate##*/}"/holders/*; do
-    [[ ! -e $holder && ! -L $holder ]] || return 1
-  done
-  swaps=$(swapon --show=NAME --noheadings --raw) || fail 'Cannot inspect swap'
-  while IFS= read -r swap_device; do
-    [[ -n $swap_device ]] || continue
-    swap_path=$(readlink -f "$swap_device") || fail 'Cannot resolve swap device'
-    [[ $swap_path != "$candidate" ]] || return 1
-  done <<< "$swaps"
-  value=$(blockdev --getsize64 "$candidate") || fail 'Cannot read disk capacity'
-  [[ $value =~ ^[1-9][0-9]*$ ]] || fail 'Invalid disk capacity'
-  (( value / 1073741824 - 2 >= min_root_gib ))
-}
+target_disk=/dev/nvme0n1
 
-discover_disks() {
-  local candidate
-  candidates=()
-  for candidate in /dev/nvme*n*; do
-    [[ $candidate =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || continue
-    if eligible_disk "$candidate"; then
-      candidates+=("$candidate")
-    else
-      echo "Excluded NVMe: $candidate (in use, non-empty, or too small)" >&2
-    fi
-  done
-  [[ ${#candidates[@]} -eq 1 ]] || fail "Expected exactly one eligible NVMe; found ${#candidates[@]}"
+# The disk is erased whatever it contains; only its existence, writability and size are checked.
+check_disk() {
+  local value
+  [[ -b $target_disk ]] || fail "$target_disk not found"
+  value=$(lsblk -dn -o TYPE "$target_disk") || fail 'Cannot read disk type'
+  [[ $value == disk ]] || fail "$target_disk is not a whole disk"
+  value=$(lsblk -dn -o RO "$target_disk") || fail 'Cannot read disk write protection'
+  [[ $value == 0 ]] || fail "$target_disk is read-only"
+  value=$(blockdev --getsize64 "$target_disk") || fail 'Cannot read disk capacity'
+  [[ $value =~ ^[1-9][0-9]*$ ]] || fail 'Invalid disk capacity'
+  (( value / 1073741824 - 2 >= min_root_gib )) || fail "$target_disk is too small: need $min_root_gib GiB root plus 2 GiB reserve"
 }
 
 udevadm settle --timeout=30 || fail 'Device discovery did not settle'
-discover_disks
-disk=${candidates[0]}
+check_disk
+disk=$target_disk
 disk_identity=$(lsblk -bdn -o MAJ:MIN,SIZE,MODEL,SERIAL,WWN "$disk") || fail 'Cannot record disk identity'
 disk_bytes=$(blockdev --getsize64 "$disk") || fail 'Cannot read disk capacity'
 ROOT_GIB=$(( disk_bytes / 1073741824 - 2 ))
@@ -498,10 +475,14 @@ late_commands:
 EOF
 
 udevadm settle --timeout=30 || fail 'Device discovery did not settle'
-discover_disks
-[[ ${candidates[0]} == "$disk" ]] || fail 'Selected disk changed'
+check_disk
 current_identity=$(lsblk -bdn -o MAJ:MIN,SIZE,MODEL,SERIAL,WWN "$disk") || fail 'Cannot recheck disk identity'
 [[ $current_identity == "$disk_identity" ]] || fail 'Disk identity changed'
+# release anything still using the disk (swap, mounts); Curtin then clears RAID/LVM/signatures
+while read -r part; do
+  swapoff "$part" 2>/dev/null || true
+  umount -R "$part" 2>/dev/null || true
+done < <(lsblk -nrpo NAME "$disk" | tail -n +2 | tac)
 curtin -c /run/cri-curtin.yaml install
 touch /run/cri-install.succeeded
 sync
@@ -514,14 +495,15 @@ SCRIPT
 chmod 755 /usr/local/sbin/cri-install
 ```
 
-No operator-supplied serial is needed. The launcher records the discovered disk
-identity and repeats selection and identity checks immediately before Curtin.
-Do not hotplug storage during installation; these checks cannot make hotplug
-race-free. Existing SATA/SAS disks are never candidates. Existing NVMe contents
-are excluded, not erased. A partial install normally leaves signatures and is
-not automatically erased and retried. Diagnose failures instead of bypassing
-the guards. Hardware RAID, multipath, NVMe-oF, and SAN storage need a separate
-reviewed selection policy; this recipe is for directly attached NVMe.
+No operator-supplied serial is needed. The launcher records the identity of
+`/dev/nvme0n1` and repeats the existence and size checks immediately before
+Curtin. Do not hotplug storage during installation. Only `/dev/nvme0n1` is
+written; SATA/SAS and other NVMe disks are never candidates. The disk's old
+contents are wiped without inspection (`wipe: superblock-recursive`), so an
+interrupted install is simply wiped and redone on the next install boot. The
+only brake on repeats is the PXE server's `/done/<mac>` marker. Hardware RAID,
+multipath, NVMe-oF, and SAN storage need a separate reviewed selection policy;
+this recipe is for a directly attached NVMe.
 
 Add the target customization helper in the same **live chroot**. It is run by
 Curtin's late stage, where `TARGET_MOUNT_POINT` is defined. Errors abort success.
@@ -600,6 +582,13 @@ StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
+EOF
+# live console auto-login as root on tty1 (no username/password prompt); live image only
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 EOF
 systemctl enable systemd-networkd-wait-online.service cri-install.service
 bash -n /usr/local/sbin/cri-install
@@ -812,18 +801,18 @@ Use an isolated bridged test network when testing DHCP/TFTP.
    access. A readiness URL alone does not prove target APT repositories work.
 3. Run `sudo /usr/local/sbin/cri-install --check`. This checks metadata and
    hashes but does not invoke Curtin or write to the destination disk.
-4. Test zero candidates, two eligible NVMes, insufficient capacity, partitions,
-  filesystem/RAID/LVM signatures, mounts, swap, and holders. Used disks must
-  never qualify; zero or multiple eligible disks must stop. Test missing or
-  duplicate URL/MAC arguments, malformed URLs, a route-NIC/MAC mismatch,
-  missing/corrupt payload, and unreachable HTTP. Each invalid case must stop.
+4. Test: no `/dev/nvme0n1`; insufficient capacity; a disk that already holds
+  partitions, filesystems, RAID/LVM, swap or a previous install (it must be wiped
+  and installed, not refused); two NVMe disks (only `nvme0n1` may change). Test
+  missing or duplicate URL/MAC arguments, malformed URLs, a route-NIC/MAC
+  mismatch, missing/corrupt payload, and unreachable HTTP. Each invalid case must stop.
 5. Select the PXE install entry manually on one fresh disposable disk. No ISO
   rebuild or embedded erase switch is needed; `cri.install=1` arms this boot.
 6. Observe Curtin and check the completion marker on the PXE server.
 7. Disconnect ISO/PXE and boot the virtual NVMe. Verify EFI boot, root UUID,
    hostname, DHCP, SSH access, unique host keys, and the actual CRI applications.
-8. Re-enable PXE and verify the done guard and disk-signature checks prevent
-   another installation. Failure recovery must not silently wipe again.
+8. Re-enable PXE and verify the `/done/<mac>` guard prevents another installation.
+   There is no disk-content guard, so test that a missing marker does reinstall.
 9. Boot two enrolled VMs concurrently using the same ISO. Verify different
    generated hostnames, SSH host keys, machine IDs after first boot, and done
    markers. One completed client must not suppress another client's install.
@@ -837,7 +826,7 @@ Use an isolated bridged test network when testing DHCP/TFTP.
 
 Only after those tests pass:
 
-1. Build and test the generic ISO once; approve each host and its eligible disk
+1. Build and test the generic ISO once; approve each host's `/dev/nvme0n1`
   for erasure, then enroll its MAC on the PXE server.
 2. Replace the served ISO and matching live kernel/initrd as one deployment
    while target machines are not booting. Verify their checksums after transfer.
@@ -897,7 +886,7 @@ sudo pxe-ctl status
 | `/cdrom/payload` missing | Inspect actual media mounts and ISO contents before adjusting the launcher and Curtin source together. |
 | Installer did not start | Diagnostic entry intentionally lacks `cri.install=1`; inspect systemd status and the kernel arguments. |
 | URL or NIC refused | Require one HTTP IPv4 ISO URL and one GRUB-supplied `cri.pxe_mac`; the route to that server must use the same physical NIC. Local ISO boot alone does not supply these. |
-| Destination refused | Zero/multiple eligible NVMes, insufficient size, existing signatures, active usage, or an earlier partial installation. Do not bypass the guard without a separate erase review. |
+| Destination refused | `/dev/nvme0n1` missing, read-only, not a whole disk, or smaller than the payload minimum root plus 2 GiB. Existing contents never cause a refusal. |
 | Curtin fails in curthooks | Check source Ubuntu compatibility, APT/DNS/routing, installed kernel/modules, bootloader packages, and UEFI variables. |
 | Installed OS has no network | Check its generated Netplan configuration, selected MAC, networkd/resolved services, and destination gateway. |
 | PXE starts again after success | Check UEFI boot order and `/var/lib/tftpboot/done/<mac>`; compare the logged runtime MAC with GRUB's PXE MAC. |
@@ -909,10 +898,13 @@ or mark the host done from the server with `sudo pxe-ctl done <mac>`. Then boot
 the installed disk. A done marker indicates installer completion, not a tested
 first boot of your applications.
 
-If installation failed or power was lost, preserve logs and inspect the disk.
-Reinstallation requires both a deliberate marker removal (`pxe-ctl reinstall
-<mac>`) and a separate, explicitly approved disk-erasure procedure. The launcher
-will not clear existing partitions simply because the marker was removed.
+If installation failed or power was lost, the live logs are in RAM: copy them
+(`/var/log/curtin/install.log`) from the console shell before rebooting. The
+next PXE boot of the install entry wipes `/dev/nvme0n1` and installs again
+unless `/done/<mac>` exists. If the callback failed after a successful install,
+mark the host done (`pxe-ctl done <mac>`) before it PXE-boots again, or it will
+be reinstalled. To deliberately reinstall a finished host, remove its marker with
+`pxe-ctl reinstall <mac>`; the launcher then erases the disk without further checks.
 
 ## References
 
