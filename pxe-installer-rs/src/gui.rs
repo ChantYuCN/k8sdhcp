@@ -461,8 +461,12 @@ fn manage_tab() -> gtk::Widget {
         ("Host status", vec!["status"]),
         ("Installed hosts", vec!["list"]),
         ("MAC bindings", vec!["binds"]),
+        ("Remount ISO (NFS)", vec!["nfs"]),
     ] {
         let b = gtk::Button::with_label(label);
+        if args[0] == "nfs" {
+            b.set_tooltip_text(Some("After copying or replacing the ISO: loop-mounts it on the NFS root and re-exports it"));
+        }
         let log = log.clone();
         b.connect_clicked(move |_| run_ctl(args.iter().map(|s| s.to_string()).collect(), &log));
         top.append(&b);
