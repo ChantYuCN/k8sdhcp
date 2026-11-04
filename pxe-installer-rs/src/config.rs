@@ -353,11 +353,7 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-<<<<<<< HEAD
             "TFTP_ROOT={}\nWEB_ROOT={}\nNFS_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nTARGET_HOSTNAME={}\n",
-=======
-            "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nTARGET_HOSTNAME={}\n",
->>>>>>> 44b64ebe933d7838e050bb41455e1fbf2c2efafd
             self.tftp_root, self.web_root, self.nfs_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
             self.target_hostname
         )

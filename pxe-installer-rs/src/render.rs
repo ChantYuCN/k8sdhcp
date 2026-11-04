@@ -200,13 +200,8 @@ mod tests {
     fn grub_guard_and_urls() {
         let s = grub_cfg(&cfg());
         assert!(s.contains("/done/${net_default_mac}"));
-<<<<<<< HEAD
         assert!(s.contains("linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=192.168.5.1:/srv/nfs/iso ip=dhcp"));
         assert!(!s.contains("url="));
-=======
-        assert!(s.contains("linux /casper/vmlinuz boot=casper ip=dhcp"));
-        assert!(s.contains("url=http://192.168.5.1/iso/ubuntu-25.04-beta-live-server-amd64.iso"));
->>>>>>> 44b64ebe933d7838e050bb41455e1fbf2c2efafd
         assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/"));
         assert!(!s.contains('@'));
     }
