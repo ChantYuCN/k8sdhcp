@@ -601,6 +601,13 @@ StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 EOF
+# live console auto-login as root on tty1 (no username/password prompt); live image only
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+EOF
 systemctl enable systemd-networkd-wait-online.service cri-install.service
 bash -n /usr/local/sbin/cri-install
 bash -n /usr/local/sbin/cri-customize
