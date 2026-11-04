@@ -22,6 +22,8 @@ pub struct Config {
     pub upstream_dns: String,
     pub set_static_ip: bool,
     pub only_known_hosts: bool,
+    /// PXE menu boots the CRI install entry by default (erases the approved NVMe); off = diagnostics
+    pub auto_install: bool,
     pub target_hostname: String,
     pub target_user: String,
     pub target_password: String,
@@ -48,6 +50,7 @@ impl Default for Config {
             upstream_dns: "8.8.8.8".into(),
             set_static_ip: false,
             only_known_hosts: false,
+            auto_install: true,
             target_hostname: "ubuntu-node".into(),
             target_user: "ubuntu".into(),
             target_password: String::new(),
@@ -143,6 +146,7 @@ impl Config {
             "UPSTREAM_DNS" => self.upstream_dns = v.into(),
             "SET_STATIC_IP" => self.set_static_ip = parse_bool(v)?,
             "ONLY_KNOWN_HOSTS" => self.only_known_hosts = parse_bool(v)?,
+            "AUTO_INSTALL" => self.auto_install = parse_bool(v)?,
             "TARGET_HOSTNAME" => self.target_hostname = v.into(),
             "TARGET_USER" => self.target_user = v.into(),
             // password: keep spaces, only strip the line ending
@@ -336,6 +340,7 @@ impl Config {
             format!("UPSTREAM_DNS={}", self.upstream_dns),
             format!("SET_STATIC_IP={}", flag(self.set_static_ip)),
             format!("ONLY_KNOWN_HOSTS={}", flag(self.only_known_hosts)),
+            format!("AUTO_INSTALL={}", flag(self.auto_install)),
             format!("TARGET_HOSTNAME={}", self.target_hostname),
             format!("TARGET_USER={}", self.target_user),
             format!("TARGET_PASSWORD={}", self.target_password),
@@ -353,8 +358,9 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nNFS_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nTARGET_HOSTNAME={}\n",
+            "TFTP_ROOT={}\nWEB_ROOT={}\nNFS_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\n",
             self.tftp_root, self.web_root, self.nfs_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
+            u8::from(self.auto_install),
             self.target_hostname
         )
     }

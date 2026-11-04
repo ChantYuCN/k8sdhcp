@@ -37,8 +37,11 @@ dhcp-boot=tag:efi64,bootx64.efi,@SERVER_IP@,@SERVER_IP@
 log-dhcp
 ";
 
+// CRI live installer (see create-casper-curtin-pxe-installer.md): casper mounts the ISO from NFS at
+// /cdrom (nothing is copied into RAM); /usr/local/sbin/cri-install runs from cri-install.service and
+// needs cri.install=1, cri.pxe_mac and cri.url. cri.url (not url=) so casper does not also download the ISO.
 const GRUB: &str = r#"set timeout=5
-set default=0
+set default=@DEFAULT@
 
 # Already installed? -> leave grub; UEFI firmware continues with the next boot entry (local disk).
 if [ -f /done/${net_default_mac} ]; then
@@ -47,9 +50,14 @@ if [ -f /done/${net_default_mac} ]; then
     exit
 fi
 
-menuentry "Autoinstall Ubuntu 25.04 (WIPES THE DISK)" {
+menuentry "CRI live diagnostics (no installation)" {
     echo "Loading kernel..."
-    linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=@SERVER_IP@:@NFS_ROOT@ ip=dhcp autoinstall "ds=nocloud-net\;s=http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/" ---
+    linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=@SERVER_IP@:@NFS_ROOT@ ip=dhcp ignore_uuid noprompt video=1920x1080@60 rw cri.url=http://@SERVER_IP@/iso/@ISO_NAME@ cri.pxe_mac=${net_default_mac} ---
+    initrd /casper/initrd
+}
+menuentry "Install CRI to the approved empty NVMe (ERASES THE DISK)" {
+    echo "Loading kernel..."
+    linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=@SERVER_IP@:@NFS_ROOT@ ip=dhcp ignore_uuid noprompt video=1920x1080@60 rw cri.url=http://@SERVER_IP@/iso/@ISO_NAME@ cri.pxe_mac=${net_default_mac} cri.install=1 ---
     initrd /casper/initrd
 }
 menuentry "Boot from local disk" {
@@ -129,7 +137,17 @@ pub fn dnsmasq_conf(c: &Config) -> String {
 }
 
 pub fn grub_cfg(c: &Config) -> String {
-    fill(GRUB, &[("SERVER_IP", c.server_ip.as_str()), ("NFS_ROOT", c.nfs_root.as_str())])
+    // entries: 0 = diagnostics, 1 = install, 2 = local disk
+    let default = if c.auto_install { "1" } else { "0" };
+    fill(
+        GRUB,
+        &[
+            ("DEFAULT", default),
+            ("SERVER_IP", c.server_ip.as_str()),
+            ("NFS_ROOT", c.nfs_root.as_str()),
+            ("ISO_NAME", c.iso_name.as_str()),
+        ],
+    )
 }
 
 pub fn user_data(c: &Config, pw_hash: &str) -> String {
@@ -201,7 +219,16 @@ mod tests {
         let s = grub_cfg(&cfg());
         assert!(s.contains("/done/${net_default_mac}"));
         assert!(s.contains("linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=192.168.5.1:/srv/nfs/iso ip=dhcp"));
-        assert!(!s.contains("url="));
+        assert!(s.contains("video=1920x1080@60 rw"));
+        assert!(s.contains("cri.url=http://192.168.5.1/iso/ubuntu-25.04-beta-live-server-amd64.iso"));
+        assert!(s.contains("cri.pxe_mac=${net_default_mac}"));
+        // casper must not also download the ISO, and exactly one entry arms the installer
+        assert!(!s.contains(" url="));
+        assert_eq!(s.matches("cri.install=1").count(), 1);
+        assert!(s.contains("set default=1"));
+        let mut c = cfg();
+        c.auto_install = false;
+        assert!(grub_cfg(&c).contains("set default=0"));
         assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/"));
         assert!(!s.contains('@'));
     }
