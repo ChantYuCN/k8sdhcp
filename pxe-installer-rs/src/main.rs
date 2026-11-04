@@ -19,6 +19,7 @@ INSTALL/START OPTIONS  (flags override --config; same names as config keys)
   --iface NAME  --server-ip IP  --prefix N  --dhcp-start IP  --dhcp-end IP
   --lease 24h  --upstream-dns IP  --static-ip  --only-known-hosts
   --target-hostname H  --target-user U  --iso-name FILE.iso   (ISO file name you place in <web-root>/iso/)
+  --nfs-root DIR             (where the ISO is loop-mounted and NFS-exported; default /srv/nfs/iso)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
 
@@ -44,6 +45,7 @@ TARGET_PASSWORD=ChangeMe-please
 
 # the ISO file name you will copy into /var/www/html/iso/ (the installer does not download or copy it)
 ISO_NAME=ubuntu-25.04-beta-live-server-amd64.iso
+NFS_ROOT=/srv/nfs/iso
 
 # fixed MAC -> IP bindings (repeat HOST=)
 # HOST=aa:bb:cc:dd:ee:01,192.168.5.11,node01

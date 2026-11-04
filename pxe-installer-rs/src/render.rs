@@ -49,7 +49,7 @@ fi
 
 menuentry "Autoinstall Ubuntu 25.04 (WIPES THE DISK)" {
     echo "Loading kernel..."
-    linux /casper/vmlinuz ip=dhcp url=http://@SERVER_IP@/iso/@ISO_NAME@ autoinstall "ds=nocloud-net\;s=http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/" ---
+    linux /casper/vmlinuz boot=casper netboot=nfs nfsroot=@SERVER_IP@:@NFS_ROOT@ ip=dhcp autoinstall "ds=nocloud-net\;s=http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/" ---
     initrd /casper/initrd
 }
 menuentry "Boot from local disk" {
@@ -129,7 +129,7 @@ pub fn dnsmasq_conf(c: &Config) -> String {
 }
 
 pub fn grub_cfg(c: &Config) -> String {
-    fill(GRUB, &[("SERVER_IP", c.server_ip.as_str()), ("ISO_NAME", c.iso_name.as_str())])
+    fill(GRUB, &[("SERVER_IP", c.server_ip.as_str()), ("NFS_ROOT", c.nfs_root.as_str())])
 }
 
 pub fn user_data(c: &Config, pw_hash: &str) -> String {
@@ -200,6 +200,7 @@ mod tests {
     fn grub_guard_and_urls() {
         let s = grub_cfg(&cfg());
         assert!(s.contains("/done/${net_default_mac}"));
+        assert!(s.contains("linux /casper/vmlinuz boot=casper ip=dhcp"));
         assert!(s.contains("url=http://192.168.5.1/iso/ubuntu-25.04-beta-live-server-amd64.iso"));
         assert!(s.contains("nocloud-net\\;s=http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/"));
         assert!(!s.contains('@'));

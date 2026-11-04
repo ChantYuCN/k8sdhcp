@@ -219,8 +219,8 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
         }
         Some("stop") => {
             // stop the PXE services (DHCP/TFTP + HTTP); they stay enabled and come back on reboot
-            run(Ctx { dry: false }, "systemctl", &["stop", "dnsmasq", "apache2"])?;
-            for svc in ["dnsmasq", "apache2"] {
+            run(Ctx { dry: false }, "systemctl", &["stop", "dnsmasq", "apache2", "nfs-server"])?;
+            for svc in ["dnsmasq", "apache2", "nfs-server"] {
                 println!("{svc}: {}", if service_active(svc) { "STILL ACTIVE" } else { "stopped" });
             }
             println!("PXE server stopped. Start it again with the Start button or: sudo systemctl start dnsmasq apache2");
@@ -230,6 +230,12 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             // run after copying netboot files into the TFTP root (the tarball ships its own grub.cfg)
             write_grub(&c, Ctx { dry: false })?;
             println!("wrote {}/grub/grub.cfg and fixed permissions", c.tftp_root);
+            Ok(())
+        }
+        Some("nfs") => {
+            // run after copying/replacing the ISO: remount it on the NFS root and re-export
+            crate::install::setup_nfs(&c, Ctx { dry: false })?;
+            println!("ISO {}/iso/{} exported on {}", c.web_root, c.iso_name, c.nfs_root);
             Ok(())
         }
         Some("binds") => {
@@ -245,7 +251,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 

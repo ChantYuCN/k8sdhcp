@@ -29,6 +29,8 @@ pub struct Config {
     pub iso_name: String,
     pub tftp_root: String,
     pub web_root: String,
+    /// Mount point where the ISO is loop-mounted and exported over NFS (the live system boots from it)
+    pub nfs_root: String,
     pub hosts_file: String,
     pub bindings: Vec<Binding>,
     pub dry_run: bool,
@@ -52,6 +54,7 @@ impl Default for Config {
             iso_name: "ubuntu-25.04-beta-live-server-amd64.iso".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
+            nfs_root: "/srv/nfs/iso".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
             bindings: Vec::new(),
             dry_run: false,
@@ -151,6 +154,7 @@ impl Config {
             "RELEASE_URL" | "NETBOOT_TAR" | "ISO_FILE" => {}
             "TFTP_ROOT" => self.tftp_root = v.trim_end_matches('/').into(),
             "WEB_ROOT" => self.web_root = v.trim_end_matches('/').into(),
+            "NFS_ROOT" => self.nfs_root = v.trim_end_matches('/').into(),
             "HOSTS_FILE" => self.hosts_file = v.into(),
             "HOST" => {
                 let mut it = v.splitn(3, ',');
@@ -282,7 +286,7 @@ impl Config {
         if !self.iso_name.ends_with(".iso") || self.iso_name.contains('/') {
             errs.push("ISO_NAME must be a plain .iso file name".to_string());
         }
-        for p in [&self.tftp_root, &self.web_root, &self.hosts_file] {
+        for p in [&self.tftp_root, &self.web_root, &self.nfs_root, &self.hosts_file] {
             if !p.starts_with('/') {
                 errs.push(format!("path '{p}' must be absolute"));
             }
@@ -336,6 +340,7 @@ impl Config {
             format!("TARGET_USER={}", self.target_user),
             format!("TARGET_PASSWORD={}", self.target_password),
             format!("ISO_NAME={}", self.iso_name),
+            format!("NFS_ROOT={}", self.nfs_root),
         ];
         for h in &self.bindings {
             lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
@@ -349,7 +354,7 @@ impl Config {
     pub fn runtime_conf(&self) -> String {
         format!(
             "TFTP_ROOT={}\nWEB_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nTARGET_HOSTNAME={}\n",
-            self.tftp_root, self.web_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
+            self.tftp_root, self.web_root, self.nfs_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
             self.target_hostname
         )
     }
