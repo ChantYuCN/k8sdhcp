@@ -141,7 +141,7 @@ fn pump(rx: Receiver<Msg>, on_line: impl Fn(&str) + 'static, on_done: impl Fn(i3
 fn write_temp_conf(c: &Config) -> std::io::Result<PathBuf> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let path = std::env::temp_dir().join(format!("pxe-gui-{}-{nanos}.conf", std::process::id()));
-    // 0600 and create_new: the file holds the target password
+    // 0600 and create_new: keeps the temp config private and refuses to follow a pre-created file
     let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
     f.write_all(c.to_conf().as_bytes())?;
     Ok(path)
@@ -171,10 +171,6 @@ fn log_view() -> (gtk::TextView, gtk::ScrolledWindow) {
 
 fn entry(text: &str) -> gtk::Entry {
     gtk::Entry::builder().hexpand(true).text(text).build()
-}
-
-fn secret(text: &str) -> gtk::Entry {
-    gtk::Entry::builder().hexpand(true).text(text).visibility(false).build()
 }
 
 fn margins(w: &impl IsA<gtk::Widget>, n: i32) {
@@ -224,17 +220,12 @@ struct Form {
     static_ip: gtk::CheckButton,
     only_known: gtk::CheckButton,
     t_host: gtk::Entry,
-    t_user: gtk::Entry,
-    t_pw: gtk::Entry,
-    t_pw2: gtk::Entry,
-    iso: gtk::Entry,
+    image: gtk::Entry,
+    disk: gtk::Entry,
 }
 
 impl Form {
     fn collect(&self) -> Result<Config, String> {
-        if text_of(&self.t_pw) != text_of(&self.t_pw2) {
-            return Err("The two passwords do not match".into());
-        }
         let mut c = Config::default();
         c.iface = text_of(&self.iface).trim().to_string();
         c.server_ip = text_of(&self.server_ip).trim().to_string();
@@ -246,9 +237,8 @@ impl Form {
         c.set_static_ip = self.static_ip.is_active();
         c.only_known_hosts = self.only_known.is_active();
         c.target_hostname = text_of(&self.t_host).trim().to_string();
-        c.target_user = text_of(&self.t_user).trim().to_string();
-        c.target_password = text_of(&self.t_pw);
-        c.iso_name = text_of(&self.iso).trim().to_string();
+        c.image_name = text_of(&self.image).trim().to_string();
+        c.target_disk = text_of(&self.disk).trim().trim_start_matches("/dev/").to_string();
 
         let errs = c.validate();
         if !errs.is_empty() {
@@ -358,34 +348,31 @@ fn install_tab() -> gtk::Widget {
 
     let tgt = gtk::Grid::builder().column_spacing(8).row_spacing(6).build();
     let t_host = entry(&d.target_hostname);
-    let t_user = entry(&d.target_user);
-    let t_pw = secret("");
-    let t_pw2 = secret("");
-    let iso = entry(&d.iso_name);
+    let image = entry(&d.image_name);
+    let disk = entry(&d.target_disk);
+    image.set_tooltip_text(Some("Folder name of the Clonezilla image inside /home/partimag (made with ocs-sr savedisk)"));
+    disk.set_tooltip_text(Some("Disk of the target that is erased and restored, e.g. nvme0n1 or sda"));
     grid_row(&tgt, 0, "Default hostname (no binding)", &t_host);
-    grid_row(&tgt, 1, "Target username", &t_user);
-    grid_row(&tgt, 2, "Target password", &t_pw);
-    grid_row(&tgt, 3, "Repeat password", &t_pw2);
-    iso.set_tooltip_text(Some("Name of the ISO you copy into /var/www/html/iso/ yourself"));
-    grid_row(&tgt, 4, "Live-server ISO file name", &iso);
+    grid_row(&tgt, 1, "Clonezilla image name", &image);
+    grid_row(&tgt, 2, "Target disk (/dev/...)", &disk);
     let warn = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
         .use_markup(true)
-        .label("<b>Warning:</b> hosts that PXE boot are <b>wiped</b> and reinstalled unless already installed (or marked done).")
+        .label("<b>Warning:</b> hosts that PXE boot have the target disk <b>wiped</b> and restored from the image unless already installed (or marked done).")
         .build();
-    tgt.attach(&warn, 0, 5, 2, 1);
+    tgt.attach(&warn, 0, 3, 2, 1);
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     body.append(&framed("Network / DHCP", &net));
-    body.append(&framed("Target OS (autoinstall)", &tgt));
+    body.append(&framed("Target OS (Clonezilla image restore)", &tgt));
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
     install_btn.set_tooltip_text(Some("Installs dnsmasq + Apache and creates the directories; services are left stopped"));
     let start_btn = gtk::Button::with_label("Start PXE server");
     start_btn.add_css_class("suggested-action");
-    start_btn.set_tooltip_text(Some("Writes the network/DHCP/autoinstall configuration and starts dnsmasq + Apache"));
+    start_btn.set_tooltip_text(Some("Writes the network/DHCP/PXE menu/NFS configuration and starts dnsmasq + Apache + NFS"));
     let stop_btn = gtk::Button::with_label("Stop PXE server");
     stop_btn.add_css_class("destructive-action");
     stop_btn.set_tooltip_text(Some("Stops dnsmasq (DHCP/TFTP) and Apache so no host can PXE boot"));
@@ -409,7 +396,7 @@ fn install_tab() -> gtk::Widget {
 
     let form = Form {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
-        t_host, t_user, t_pw, t_pw2, iso,
+        t_host, image, disk,
     };
 
     let ui = Rc::new(RunUi { log, step_label, progress, buttons: vec![install_btn.clone(), start_btn.clone()] });
@@ -424,7 +411,7 @@ fn install_tab() -> gtk::Widget {
     }
 
     {
-        // Install needs none of the form values (and so none of its validation, e.g. the password)
+        // Install needs none of the form values (and so none of its validation)
         let ui = ui.clone();
         install_btn.connect_clicked(move |_| {
             run_installer("install", 4.0, "PXE packages installed; services stopped. Click \"Start PXE server\" next.", Ok(Config::default()), &ui)
@@ -461,11 +448,11 @@ fn manage_tab() -> gtk::Widget {
         ("Host status", vec!["status"]),
         ("Installed hosts", vec!["list"]),
         ("MAC bindings", vec!["binds"]),
-        ("Remount ISO (NFS)", vec!["nfs"]),
+        ("Re-export images (NFS)", vec!["nfs"]),
     ] {
         let b = gtk::Button::with_label(label);
         if args[0] == "nfs" {
-            b.set_tooltip_text(Some("After copying or replacing the ISO: loop-mounts it on the NFS root and re-exports it"));
+            b.set_tooltip_text(Some("After adding or changing a Clonezilla image: re-exports the image folder over NFS and checks the image exists"));
         }
         let log = log.clone();
         b.connect_clicked(move |_| run_ctl(args.iter().map(|s| s.to_string()).collect(), &log));

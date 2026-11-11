@@ -1,6 +1,7 @@
-//! The `install` command installs dnsmasq + Apache and creates the directories; the `start` command
-//! writes their PXE configuration and starts them.
-//! It does NOT download or copy the netboot image or the ISO - the admin places those manually.
+//! The `install` command installs dnsmasq + Apache + NFS and creates the directories; the `start` command
+//! writes their PXE configuration and starts them. Targets boot Clonezilla Live over PXE and restore a
+//! Clonezilla image (served over NFS) onto their disk.
+//! It does NOT download or copy the netboot files, Clonezilla Live or the image - the admin places those.
 use std::fs;
 use std::path::Path;
 
@@ -9,9 +10,18 @@ use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
-const PACKAGES: [&str; 5] = ["dnsmasq", "apache2", "curl", "openssl", "nfs-kernel-server"];
+const PACKAGES: [&str; 4] = ["dnsmasq", "apache2", "curl", "nfs-kernel-server"];
 
-/// `validate`: `start` needs a complete config (incl. the target password); `install` only needs the paths.
+/// Where the admin puts Clonezilla Live: kernel + initrd under the TFTP root, the live filesystem under
+/// the web root (the target fetches it over HTTP).
+fn cz_tftp_dir(c: &Config) -> String {
+    format!("{}/clonezilla", c.tftp_root)
+}
+fn cz_web_dir(c: &Config) -> String {
+    format!("{}/clonezilla", c.web_root)
+}
+
+/// `validate`: `start` needs a complete, valid config; `install` only needs the paths.
 fn prepare(c: &Config, validate: bool) -> Result<Ctx, String> {
     if validate {
         let errs = c.validate();
@@ -41,7 +51,7 @@ pub fn install(c: &Config) -> Result<(), String> {
     run(ctx, "apt-get", &apt)?;
 
     step("Creating directories");
-    for dir in [format!("{}/iso", c.web_root), format!("{}/autoinstall", c.web_root), c.tftp_root.clone(), c.nfs_root.clone()] {
+    for dir in [c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone()] {
         mkdir(ctx, &dir)?;
         set_mode_soft(ctx, &dir, 0o755);
     }
@@ -92,14 +102,17 @@ pub fn start(c: &Config) -> Result<(), String> {
     println!(
         "\nPXE services are running ({} / {}-{}).\n\n\
          NEXT STEPS (manual - this installer does not download or copy these files):\n\
-         \x20 1. Netboot files (bootx64.efi, grubx64.efi, casper/vmlinuz, casper/initrd, ...)\n\
+         \x20 1. UEFI boot files (bootx64.efi, grubx64.efi, grub/, ... from the Ubuntu netboot tarball)\n\
          \x20      -> copy into {}/\n\
-         \x20    then run:  sudo pxe-ctl grub     (re-applies our grub.cfg and file permissions)\n\
-         \x20 2. Live-server ISO  -> {}/iso/{}\n\
-         \x20    (loop-mounted on {} and exported over NFS: the live system boots from there, not from RAM;\n\
-         \x20     after copying or replacing the ISO run:  sudo pxe-ctl nfs)\n\n\
-         Then boot the target host in UEFI mode with \"PXE IPv4\" as first boot device.\n\
-         Duplicate-install guard: installed hosts are recorded in {}/<mac>\n\
+         \x20 2. Clonezilla Live (the amd64 zip from clonezilla.org, folder live/):\n\
+         \x20      vmlinuz, initrd.img          -> {}/\n\
+         \x20      filesystem.squashfs          -> {}/\n\
+         \x20    then run:  sudo pxe-ctl grub   (re-applies our grub.cfg and file permissions)\n\
+         \x20 3. The Clonezilla image \"{}\" (made with ocs-sr savedisk) -> {}/{}/\n\
+         \x20    exported read-only over NFS; after adding or changing it run:  sudo pxe-ctl nfs\n\n\
+         Then boot the target in UEFI mode with \"PXE IPv4\" as first boot device. It restores the image\n\
+         onto /dev/{} (ERASES THE DISK) and reboots.\n\
+         Duplicate-install guard: restored hosts are recorded in {}/<mac>\n\
          \x20 sudo pxe-ctl status | list | reinstall <mac> | done <mac>\n\
          \x20 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>\n\
          Watch requests with: journalctl -fu dnsmasq",
@@ -107,18 +120,18 @@ pub fn start(c: &Config) -> Result<(), String> {
         c.dhcp_start,
         c.dhcp_end,
         c.tftp_root,
-        c.web_root,
-        c.iso_name,
-        c.nfs_root,
+        cz_tftp_dir(c),
+        cz_web_dir(c),
+        c.image_name,
+        c.image_dir,
+        c.image_name,
+        c.target_disk,
         c.done_dir()
     );
     Ok(())
 }
 
 fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
-    let iso_dir = format!("{}/iso", c.web_root);
-    let ai_dir = format!("{}/autoinstall", c.web_root);
-
     // ---- 1. server network (optional) ----
     if c.set_static_ip {
         step(&format!("Configuring static IP {}/{} on {}", c.server_ip, c.prefix, c.iface));
@@ -184,28 +197,19 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
     write_file(ctx, CTL_WRAPPER_PATH, &render::ctl_wrapper(), 0o755, false)?;
     write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
 
-    // ---- 7. Apache: web dirs, autoinstall files, "done" callback ----
+    // ---- 7. Apache: Clonezilla web dir, "done" callback, per-MAC post-restore script ----
     step("Configuring Apache");
-    mkdir(ctx, &iso_dir)?;
-    mkdir(ctx, &ai_dir)?;
-    set_mode_soft(ctx, &iso_dir, 0o755);
-    set_mode_soft(ctx, &ai_dir, 0o755);
-
-    let pw_hash = if ctx.dry {
-        "$6$dryrun$hash".to_string()
-    } else {
-        output_with_stdin("openssl", &["passwd", "-6", "-stdin"], &c.target_password)?
-    };
-    write_file(ctx, &format!("{ai_dir}/meta-data"), "", 0o644, false)?;
-    write_file(ctx, &format!("{ai_dir}/user-data"), &render::user_data(c, &pw_hash), 0o644, false)?;
+    let cz_web = cz_web_dir(c);
+    mkdir(ctx, &cz_web)?;
+    set_mode_soft(ctx, &cz_web, 0o755);
     write_file(ctx, CGI_PATH, &render::cgi_wrapper(), 0o755, false)?;
     write_file(ctx, CGI_SEED_PATH, &render::cgi_seed_wrapper(), 0o755, false)?;
     write_file(ctx, "/etc/apache2/conf-available/pxe-done.conf", &render::apache_conf(c), 0o644, false)?;
     run(ctx, "a2enmod", &["cgi"])?;
     run(ctx, "a2enconf", &["serve-cgi-bin", "pxe-done"])?;
 
-    // ---- 8. NFS export of the loop-mounted ISO (the live system boots from it instead of RAM) ----
-    step("Configuring NFS export of the ISO");
+    // ---- 8. NFS export of the Clonezilla image repository ----
+    step("Configuring NFS export of the Clonezilla images");
     setup_nfs(c, ctx)?;
 
     // ---- 9. enable + start services ----
@@ -239,8 +243,9 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
             println!("{svc}: {}", if ctl::service_active(svc) { "active" } else { "NOT ACTIVE" });
         }
         let base = format!("http://{}", c.server_ip);
-        // Apache was only just restarted, so give it a moment before calling it unreachable
-        let url = format!("{base}/autoinstall/user-data");
+        // Apache was only just restarted, so give it a moment before calling it unreachable.
+        // The post-restore script is generated by the pxe-seed CGI, so this also proves the CGI works.
+        let url = format!("{base}/cgi-bin/pxe-seed/aa:bb:cc:dd:ee:ff/post.sh");
         let mut last = String::new();
         let ok = (0..5).any(|i| {
             if i > 0 {
@@ -259,7 +264,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
             }
         });
         if !ok {
-            warn(&format!("autoinstall user-data not reachable at {url}: {last}"));
+            warn(&format!("post-restore script not reachable at {url}: {last}"));
             let have = output("ip", &["-4", "addr", "show", "dev", &c.iface]).unwrap_or_default();
             if !have.contains(&format!("inet {}/", c.server_ip)) {
                 warn(&format!(
@@ -273,11 +278,16 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
             warn("pxe-done CGI not working");
         }
         // not errors: the admin copies these by hand after the install
-        if !Path::new(&format!("{}/bootx64.efi", c.tftp_root)).exists() {
-            println!("note: {}/bootx64.efi not present yet (copy the netboot files)", c.tftp_root);
-        }
-        if !Path::new(&format!("{iso_dir}/{}", c.iso_name)).exists() {
-            println!("note: {iso_dir}/{} not present yet (copy the ISO)", c.iso_name);
+        for (path, what) in [
+            (format!("{}/bootx64.efi", c.tftp_root), "UEFI boot files from the netboot tarball"),
+            (format!("{}/vmlinuz", cz_tftp_dir(c)), "Clonezilla Live vmlinuz"),
+            (format!("{}/initrd.img", cz_tftp_dir(c)), "Clonezilla Live initrd.img"),
+            (format!("{}/filesystem.squashfs", cz_web_dir(c)), "Clonezilla Live filesystem.squashfs"),
+            (format!("{}/{}", c.image_dir, c.image_name), "the Clonezilla image"),
+        ] {
+            if !Path::new(&path).exists() {
+                println!("note: {path} not present yet ({what})");
+            }
         }
     }
     Ok(())
@@ -287,52 +297,50 @@ const NFS_MOUNTD_PORT: &str = "20048";
 const FSTAB: &str = "/etc/fstab";
 const FSTAB_MARK: &str = "# pxe-installer";
 
-/// Loop-mount the ISO on `nfs_root` (persistently via fstab) and export it read-only to the PXE subnet.
-/// The ISO itself may not exist yet; `pxe-ctl nfs` re-runs this once it has been copied.
+/// Export the Clonezilla image repository (`image_dir`) read-only to the PXE subnet; the target mounts it
+/// on /home/partimag. The images themselves may not exist yet; `pxe-ctl nfs` re-runs this (and reports
+/// whether the configured image is there) once they have been added.
 pub fn setup_nfs(c: &Config, ctx: Ctx) -> Result<(), String> {
-    let iso = format!("{}/iso/{}", c.web_root, c.iso_name);
     let net = c.network().map(|n| format!("{n}/{}", c.prefix)).unwrap_or_default();
 
-    mkdir(ctx, &c.nfs_root)?;
+    mkdir(ctx, &c.image_dir)?;
+    drop_old_iso_mount(ctx)?;
 
-    // fstab: replace our previous line (the ISO name may have changed), keep everything else
-    let line = format!("{iso} {} iso9660 loop,ro,nofail 0 0 {FSTAB_MARK}", c.nfs_root);
-    if ctx.dry {
-        println!("[dry-run] fstab: {line}");
-    } else {
-        let old = fs::read_to_string(FSTAB).unwrap_or_default();
-        let mut text: String = old.lines().filter(|l| !l.ends_with(FSTAB_MARK)).map(|l| format!("{l}\n")).collect();
-        text.push_str(&line);
-        text.push('\n');
-        if text != old {
-            fs::write(FSTAB, text).map_err(|e| format!("write {FSTAB}: {e}"))?;
-            run_soft(ctx, "systemctl", &["daemon-reload"]);
-        }
-    }
-
-    // pin mountd so the firewall rule is predictable (the initramfs mounts with NFSv3)
+    // pin mountd so the firewall rule is predictable (the Clonezilla initrd mounts with NFSv3)
     write_file(ctx, "/etc/nfs.conf.d/pxe-installer.conf", &format!("[mountd]\nport={NFS_MOUNTD_PORT}\n"), 0o644, false)?;
     write_file(
         ctx,
         "/etc/exports.d/pxe-installer.exports",
-        &format!("{} {net}(ro,fsid=1,no_subtree_check,no_root_squash,async)\n", c.nfs_root),
+        &format!("{} {net}(ro,no_subtree_check,no_root_squash,async)\n", c.image_dir),
         0o644,
         false,
     )?;
+    run(ctx, "exportfs", &["-ra"])?;
 
+    if !ctx.dry && !Path::new(&format!("{}/{}", c.image_dir, c.image_name)).is_dir() {
+        println!(
+            "note: image {}/{} not present yet - create it with ocs-sr savedisk or copy it there",
+            c.image_dir, c.image_name
+        );
+    }
+    Ok(())
+}
+
+/// Older versions loop-mounted the live-server ISO through an fstab line of ours. Remove that line so the
+/// stale mount does not come back after a reboot (the mount point itself is left alone).
+fn drop_old_iso_mount(ctx: Ctx) -> Result<(), String> {
     if ctx.dry {
-        println!("[dry-run] (re)mount {iso} on {}; exportfs -ra", c.nfs_root);
         return Ok(());
     }
-    if !Path::new(&iso).exists() {
-        println!("note: {iso} not present yet - copy the ISO, then run: sudo pxe-ctl nfs");
+    let Ok(old) = fs::read_to_string(FSTAB) else { return Ok(()) };
+    if !old.lines().any(|l| l.ends_with(FSTAB_MARK)) {
         return Ok(());
     }
-    if probe("mountpoint", &["-q", &c.nfs_root]) {
-        run(ctx, "umount", &[&c.nfs_root])?; // may hold an older ISO
-    }
-    run(ctx, "mount", &[&c.nfs_root])?;
-    run(ctx, "exportfs", &["-ra"])
+    let text: String = old.lines().filter(|l| !l.ends_with(FSTAB_MARK)).map(|l| format!("{l}\n")).collect();
+    fs::write(FSTAB, text).map_err(|e| format!("write {FSTAB}: {e}"))?;
+    run_soft(ctx, "systemctl", &["daemon-reload"]);
+    println!("removed the old ISO loop-mount line from {FSTAB}");
+    Ok(())
 }
 
 const DNSMASQ_GLOBAL: &str = "/etc/dnsmasq.conf";

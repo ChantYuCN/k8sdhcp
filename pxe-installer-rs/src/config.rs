@@ -22,17 +22,18 @@ pub struct Config {
     pub upstream_dns: String,
     pub set_static_ip: bool,
     pub only_known_hosts: bool,
-    /// PXE menu boots the CRI install entry by default (erases the approved NVMe); off = diagnostics
+    /// PXE menu restores the Clonezilla image by default (ERASES the target disk); off = interactive Clonezilla
     pub auto_install: bool,
+    /// Hostname given to a restored host that has no hostname bound to its MAC
     pub target_hostname: String,
-    pub target_user: String,
-    pub target_password: String,
-    /// File name of the live-server ISO the admin places in <web_root>/iso/ (used in grub.cfg)
-    pub iso_name: String,
+    /// Name of the Clonezilla image (a directory inside `image_dir`) that is restored onto the targets
+    pub image_name: String,
+    /// Clonezilla image repository: exported read-only over NFS and mounted on /home/partimag by the target
+    pub image_dir: String,
+    /// Disk of the target the image is restored onto (name under /dev, e.g. nvme0n1)
+    pub target_disk: String,
     pub tftp_root: String,
     pub web_root: String,
-    /// Mount point where the ISO is loop-mounted and exported over NFS (the live system boots from it)
-    pub nfs_root: String,
     pub hosts_file: String,
     pub bindings: Vec<Binding>,
     pub dry_run: bool,
@@ -52,12 +53,11 @@ impl Default for Config {
             only_known_hosts: false,
             auto_install: true,
             target_hostname: "ubuntu-node".into(),
-            target_user: "ubuntu".into(),
-            target_password: String::new(),
-            iso_name: "ubuntu-25.04-beta-live-server-amd64.iso".into(),
+            image_name: "cri-golden".into(),
+            image_dir: "/home/partimag".into(),
+            target_disk: "nvme0n1".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
-            nfs_root: "/srv/nfs/iso".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
             bindings: Vec::new(),
             dry_run: false,
@@ -94,13 +94,17 @@ pub fn is_hostname(h: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-fn is_username(u: &str) -> bool {
-    let b = u.as_bytes();
-    !b.is_empty()
-        && b.len() <= 32
-        && (b[0].is_ascii_lowercase() || b[0] == b'_')
-        && b.iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+/// Clonezilla image name: a plain directory name (it ends up in the kernel command line and a shell command).
+pub fn is_image_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && !n.starts_with('.')
+        && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+}
+
+/// Disk name under /dev (nvme0n1, sda, vda ...).
+pub fn is_disk_name(d: &str) -> bool {
+    !d.is_empty() && d.len() <= 16 && d.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 fn is_lease(l: &str) -> bool {
@@ -148,17 +152,14 @@ impl Config {
             "ONLY_KNOWN_HOSTS" => self.only_known_hosts = parse_bool(v)?,
             "AUTO_INSTALL" => self.auto_install = parse_bool(v)?,
             "TARGET_HOSTNAME" => self.target_hostname = v.into(),
-            "TARGET_USER" => self.target_user = v.into(),
-            // password: keep spaces, only strip the line ending
-            "TARGET_PASSWORD" => {
-                self.target_password = val.trim_end_matches(|c| c == '\r' || c == '\n').into()
-            }
-            "ISO_NAME" => self.iso_name = v.into(),
-            // settings from older versions that downloaded files: accepted and ignored
+            "IMAGE_NAME" => self.image_name = v.into(),
+            "IMAGE_DIR" => self.image_dir = v.trim_end_matches('/').into(),
+            "TARGET_DISK" => self.target_disk = v.trim_start_matches("/dev/").into(),
+            // settings of older (autoinstall / ISO based) versions: accepted and ignored
+            "TARGET_USER" | "TARGET_PASSWORD" | "ISO_NAME" | "NFS_ROOT" => {}
             "RELEASE_URL" | "NETBOOT_TAR" | "ISO_FILE" => {}
             "TFTP_ROOT" => self.tftp_root = v.trim_end_matches('/').into(),
             "WEB_ROOT" => self.web_root = v.trim_end_matches('/').into(),
-            "NFS_ROOT" => self.nfs_root = v.trim_end_matches('/').into(),
             "HOSTS_FILE" => self.hosts_file = v.into(),
             "HOST" => {
                 let mut it = v.splitn(3, ',');
@@ -191,9 +192,6 @@ impl Config {
     /// Parse `install` arguments: --config FILE first, then flags override it.
     pub fn from_args(args: &[String]) -> Result<Config, String> {
         let mut c = Config::default();
-        if let Ok(pw) = std::env::var("PXE_TARGET_PASSWORD") {
-            c.target_password = pw;
-        }
         // pass 1: config files
         let mut i = 0;
         while i < args.len() {
@@ -278,19 +276,17 @@ impl Config {
         if !is_hostname(&self.target_hostname) {
             errs.push("TARGET_HOSTNAME may only contain a-z, 0-9 and '-'".to_string());
         }
-        if !is_username(&self.target_user) {
-            errs.push("TARGET_USER must be lowercase letters, digits, '_' or '-'".to_string());
+        if !is_image_name(&self.image_name) {
+            errs.push("IMAGE_NAME may only contain letters, digits, '.', '_' and '-'".to_string());
         }
-        if self.target_password.chars().count() < 8 {
-            errs.push(
-                "TARGET_PASSWORD must be at least 8 characters (config file or PXE_TARGET_PASSWORD)"
-                    .to_string(),
-            );
+        if !is_disk_name(&self.target_disk) {
+            errs.push("TARGET_DISK must be a disk name such as nvme0n1 or sda (no /dev/ prefix)".to_string());
         }
-        if !self.iso_name.ends_with(".iso") || self.iso_name.contains('/') {
-            errs.push("ISO_NAME must be a plain .iso file name".to_string());
+        // image_dir is put on the target's kernel command line (inside a quoted mount command)
+        if !self.image_dir.bytes().all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)) {
+            errs.push("IMAGE_DIR may only contain letters, digits, '/', '.', '_' and '-'".to_string());
         }
-        for p in [&self.tftp_root, &self.web_root, &self.nfs_root, &self.hosts_file] {
+        for p in [&self.tftp_root, &self.web_root, &self.image_dir, &self.hosts_file] {
             if !p.starts_with('/') {
                 errs.push(format!("path '{p}' must be absolute"));
             }
@@ -342,10 +338,9 @@ impl Config {
             format!("ONLY_KNOWN_HOSTS={}", flag(self.only_known_hosts)),
             format!("AUTO_INSTALL={}", flag(self.auto_install)),
             format!("TARGET_HOSTNAME={}", self.target_hostname),
-            format!("TARGET_USER={}", self.target_user),
-            format!("TARGET_PASSWORD={}", self.target_password),
-            format!("ISO_NAME={}", self.iso_name),
-            format!("NFS_ROOT={}", self.nfs_root),
+            format!("IMAGE_NAME={}", self.image_name),
+            format!("IMAGE_DIR={}", self.image_dir),
+            format!("TARGET_DISK={}", self.target_disk),
         ];
         for h in &self.bindings {
             lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
@@ -358,8 +353,9 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nNFS_ROOT={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nISO_NAME={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\n",
-            self.tftp_root, self.web_root, self.nfs_root, self.hosts_file, self.server_ip, self.prefix, self.iso_name,
+            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\n",
+            self.tftp_root, self.web_root, self.image_dir, self.image_name, self.target_disk, self.hosts_file,
+            self.server_ip, self.prefix,
             u8::from(self.auto_install),
             self.target_hostname
         )
@@ -380,7 +376,7 @@ mod tests {
     use super::*;
 
     fn good() -> Config {
-        Config { target_password: "longenough1".into(), ..Config::default() }
+        Config::default()
     }
 
     #[test]
@@ -389,11 +385,29 @@ mod tests {
     }
 
     #[test]
-    fn iso_name_checked() {
+    fn image_and_disk_checked() {
         let mut c = good();
-        c.iso_name = "dir/x.iso".into();
-        assert!(c.validate().iter().any(|e| e.contains("ISO_NAME")));
-        assert!(good().set("RELEASE_URL", "http://x").is_ok()); // ignored, not an error
+        c.image_name = "dir/img".into();
+        assert!(c.validate().iter().any(|e| e.contains("IMAGE_NAME")));
+        let mut c = good();
+        c.image_name = "x\"; reboot".into(); // must never reach the kernel command line / a shell
+        assert!(c.validate().iter().any(|e| e.contains("IMAGE_NAME")));
+        let mut c = good();
+        c.target_disk = "nvme0n1 sda".into();
+        assert!(c.validate().iter().any(|e| e.contains("TARGET_DISK")));
+        let mut c = good();
+        c.image_dir = "relative/dir".into();
+        assert!(c.validate().iter().any(|e| e.contains("absolute")));
+        let mut c = good();
+        c.image_dir = "/srv/my images".into(); // a space would split the kernel argument
+        assert!(c.validate().iter().any(|e| e.contains("IMAGE_DIR")));
+        // "/dev/" prefix is accepted and stripped; settings of older versions are ignored, not errors
+        let mut c = good();
+        c.set("TARGET_DISK", "/dev/sda").unwrap();
+        assert_eq!(c.target_disk, "sda");
+        for k in ["RELEASE_URL", "ISO_NAME", "NFS_ROOT", "TARGET_USER", "TARGET_PASSWORD"] {
+            assert!(c.set(k, "x").is_ok(), "{k}");
+        }
     }
 
     #[test]
@@ -446,14 +460,15 @@ mod tests {
     #[test]
     fn conf_roundtrip() {
         let mut c = good();
-        c.target_password = "pa ss'$word".into();
+        c.image_name = "golden-2".into();
+        c.target_disk = "sda".into();
         c.set("HOST", "aa:bb:cc:dd:ee:01,192.168.5.11,n1").unwrap();
         let path = std::env::temp_dir().join(format!("pxe-rt-{}.conf", std::process::id()));
         std::fs::write(&path, c.to_conf()).unwrap();
         let mut d = Config::default();
         d.load_file(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(d.target_password, "pa ss'$word");
+        assert_eq!((d.image_name.as_str(), d.target_disk.as_str()), ("golden-2", "sda"));
         assert_eq!(d.bindings, c.bindings);
         assert_eq!(d.prefix, 24);
     }

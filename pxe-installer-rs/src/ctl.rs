@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::{is_hostname, is_mac, normalize_mac, Config};
+use crate::config::{is_disk_name, is_hostname, is_mac, normalize_mac, Config};
 use crate::render;
 use crate::util::{mkdir, now_iso, probe, run, run_soft, write_file, Ctx};
 
@@ -233,9 +233,9 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("nfs") => {
-            // run after copying/replacing the ISO: remount it on the NFS root and re-export
+            // run after adding or changing a Clonezilla image: (re-)export the image repository
             crate::install::setup_nfs(&c, Ctx { dry: false })?;
-            println!("ISO {}/iso/{} exported on {}", c.web_root, c.iso_name, c.nfs_root);
+            println!("Clonezilla image repository {} exported read-only (image: {})", c.image_dir, c.image_name);
             Ok(())
         }
         Some("binds") => {
@@ -271,20 +271,6 @@ pub fn cgi_done() -> Result<(), String> {
     Ok(())
 }
 
-/// Replace the `hostname:` value in an autoinstall user-data (indentation kept).
-pub fn set_hostname(user_data: &str, host: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for line in user_data.lines() {
-        if line.trim_start().starts_with("hostname:") {
-            let indent = &line[..line.len() - line.trim_start().len()];
-            out.push(format!("{indent}hostname: {host}"));
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    out.join("\n") + "\n"
-}
-
 /// Hostname bound to this MAC (third field of its binding), if any and valid.
 fn hostname_for(c: &Config, mac: &str) -> Option<String> {
     for l in read_hosts(c) {
@@ -304,15 +290,16 @@ fn cgi_error(status: &str, msg: &str) {
     print!("Status: {status}\r\nContent-Type: text/plain\r\n\r\n{msg}\n");
 }
 
-/// `pxe-installer cgi-seed` - Apache CGI at /cgi-bin/pxe-seed/<mac>/{user-data,meta-data}.
-/// The installer fetches its autoinstall seed from here (grub.cfg passes its own MAC), so each
-/// machine gets the hostname bound to its MAC; MACs without a binding get the default hostname.
+/// `pxe-installer cgi-seed` - Apache CGI at /cgi-bin/pxe-seed/<mac>/post.sh.
+/// After restoring the Clonezilla image, the target fetches this script (grub.cfg passes its own MAC) and
+/// runs it: it gives the clone the hostname bound to its MAC (MACs without a binding get the default
+/// hostname), regenerates its machine-id / SSH host keys and calls pxe-done.
 pub fn cgi_seed() -> Result<(), String> {
     let c = Config::load_runtime();
     let path = std::env::var("PATH_INFO").unwrap_or_default();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     if parts.len() != 2 {
-        cgi_error("404 Not Found", "expected /<mac>/user-data");
+        cgi_error("404 Not Found", "expected /<mac>/post.sh");
         return Ok(());
     }
     let mac = normalize_mac(parts[0]);
@@ -321,17 +308,14 @@ pub fn cgi_seed() -> Result<(), String> {
         return Ok(());
     }
     match parts[1] {
-        "meta-data" => print!("Content-Type: text/plain\r\n\r\n"),
-        "user-data" => {
-            let base = match fs::read_to_string(format!("{}/autoinstall/user-data", c.web_root)) {
-                Ok(t) => t,
-                Err(e) => {
-                    cgi_error("500 Internal Server Error", &format!("default user-data missing: {e}"));
-                    return Ok(());
-                }
-            };
+        "post.sh" => {
+            // these values are substituted into a root shell script: refuse anything but plain names
             let host = hostname_for(&c, &mac).unwrap_or_else(|| c.target_hostname.clone());
-            print!("Content-Type: text/plain\r\n\r\n{}", set_hostname(&base, &host));
+            if !is_hostname(&host) || !is_disk_name(&c.target_disk) {
+                cgi_error("500 Internal Server Error", "invalid hostname or target disk in /etc/pxe-installer.conf");
+                return Ok(());
+            }
+            print!("Content-Type: text/plain\r\n\r\n{}", render::post_script(&c, &host, &mac));
         }
         _ => cgi_error("404 Not Found", "unknown file"),
     }
@@ -372,15 +356,6 @@ mod tests {
         let c = tmp_cfg("bad");
         assert!(bind(&c, "nope", "192.168.5.11", "", false).is_err());
         assert!(bind(&c, "aa:bb:cc:dd:ee:01", "300.1.1.1", "", false).is_err());
-    }
-
-    #[test]
-    fn hostname_replaced_per_mac() {
-        let base = "autoinstall:\n  identity:\n    hostname: ubuntu-node\n    username: ubuntu\n";
-        let out = set_hostname(base, "node07");
-        assert!(out.contains("    hostname: node07\n"));
-        assert!(out.contains("username: ubuntu"));
-        assert!(!out.contains("ubuntu-node"));
     }
 
     #[test]

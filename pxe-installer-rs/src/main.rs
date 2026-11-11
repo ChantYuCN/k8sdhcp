@@ -1,16 +1,17 @@
 //! pxe-installer: one static binary that installs and manages a UEFI PXE server
-//! (dnsmasq for DHCP/DNS/TFTP + Apache for ISO/autoinstall) with per-host install tracking.
+//! (dnsmasq for DHCP/DNS/TFTP, Apache, NFS) that deploys a Clonezilla image to targets, with per-host
+//! install tracking.
 use pxe_installer::{config, ctl, install};
 
 use std::process::exit;
 
 const USAGE: &str = "\
-pxe-installer - UEFI PXE server installer (dnsmasq + Apache)
+pxe-installer - UEFI PXE server that deploys a Clonezilla image (dnsmasq + Apache + NFS)
 
 USAGE
   pxe-installer install [--config FILE] [--dry-run] [options]   install packages + create directories, services left stopped
-  pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/autoinstall, start dnsmasq + Apache
-  pxe-installer ctl list | status | stop | grub | reinstall <mac> | done <mac>
+  pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
+  pxe-installer ctl list | status | stop | grub | nfs | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
@@ -18,13 +19,12 @@ USAGE
 INSTALL/START OPTIONS  (flags override --config; same names as config keys)
   --iface NAME  --server-ip IP  --prefix N  --dhcp-start IP  --dhcp-end IP
   --lease 24h  --upstream-dns IP  --static-ip  --only-known-hosts
-  --target-hostname H  --target-user U  --iso-name FILE.iso   (ISO file name you place in <web-root>/iso/)
-  --nfs-root DIR             (where the ISO is loop-mounted and NFS-exported; default /srv/nfs/iso)
+  --target-hostname H        (hostname of a restored host that has none bound to its MAC)
+  --image-name NAME          (Clonezilla image restored onto the targets; default cri-golden)
+  --image-dir DIR            (image repository, NFS-exported read-only; default /home/partimag)
+  --target-disk DISK         (disk of the target that is ERASED and restored; default nvme0n1)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
-
-The target password is read from the config file (TARGET_PASSWORD=...) or the
-PXE_TARGET_PASSWORD environment variable - never pass it on the command line.
 ";
 
 const SAMPLE_CONFIG: &str = "\
@@ -40,12 +40,12 @@ SET_STATIC_IP=0
 ONLY_KNOWN_HOSTS=0
 
 TARGET_HOSTNAME=ubuntu-node
-TARGET_USER=ubuntu
-TARGET_PASSWORD=ChangeMe-please
 
-# the ISO file name you will copy into /var/www/html/iso/ (the installer does not download or copy it)
-ISO_NAME=ubuntu-25.04-beta-live-server-amd64.iso
-NFS_ROOT=/srv/nfs/iso
+# Clonezilla image (a folder inside IMAGE_DIR, made with ocs-sr savedisk) restored onto TARGET_DISK of
+# every target that PXE boots. TARGET_DISK is ERASED. The installer does not create or copy the image.
+IMAGE_NAME=cri-golden
+IMAGE_DIR=/home/partimag
+TARGET_DISK=nvme0n1
 
 # fixed MAC -> IP bindings (repeat HOST=)
 # HOST=aa:bb:cc:dd:ee:01,192.168.5.11,node01
