@@ -30,23 +30,47 @@ sudo apt install libgtk-4-dev build-essential pkg-config curl  # GUI only
 Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) and
 `target/release/pxe-installer-gui` (GUI; keep it in the same folder as `pxe-installer`).
 
-## What it does NOT do
-The installer installs/configures dnsmasq, Apache and NFS. It never downloads or creates the boot files,
-Clonezilla Live or the image - you place them yourself (`start` prints these steps and notes what is missing):
+## What `install` downloads and places
+`install` installs the packages (dnsmasq, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
+`clonezilla partclone pigz zstd`) and, unless `DOWNLOAD=0` / `--no-download`, downloads two archives into
+`DOWNLOAD_DIR` (default `/var/cache/pxe-installer`; a valid copy there is not downloaded again), checks that
+they are real archives, and extracts them:
+
+| Download (config key) | Default | Placed in |
+| --- | --- | --- |
+| Ubuntu netboot tarball (`NETBOOT_URL`) | `https://releases.ubuntu.com/26.04/ubuntu-26.04.1-netboot-amd64.tar.gz` | its `amd64/` folder (`bootx64.efi`, `grubx64.efi`, `grub/` ...) -> the TFTP root `/var/lib/tftpboot/` |
+| Clonezilla Live zip (`CLONEZILLA_URL`) | `https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.zip/download?use_mirror=twds` | `live/vmlinuz`, `live/initrd.img` -> `/var/lib/tftpboot/clonezilla/`; `live/filesystem.squashfs` -> `/var/www/html/clonezilla/`; the whole zip -> `LIVE_ROOT` (`/srv/nfs/clonezilla`) |
+
+Clonezilla Live is placed for both deploy ways, so `pxe-ctl mode` can switch at any time. The netboot tarball
+ships its own `grub/grub.cfg`; a PXE menu that `start` already wrote is put back after extracting, and the
+tree is made root-owned/read-only again (except the `done/` marker folder). Change the versions or mirrors
+with `NETBOOT_URL=` / `CLONEZILLA_URL=` (or `--netboot-url` / `--clonezilla-url`); the file name is taken from
+the URL (for SourceForge's `.../<file>.zip/download` links, the segment before `/download`). The downloads
+need internet access on the server; with `--no-download` copy the files yourself:
 ```
-# 1. UEFI boot files from the Ubuntu netboot tarball (amd64/*) into the TFTP root
-sudo cp -r amd64/* /var/lib/tftpboot/
-# 2. Clonezilla Live (clonezilla-live-*-amd64.zip, folder live/); kernel + initrd always go to TFTP
-sudo cp live/vmlinuz live/initrd.img        /var/lib/tftpboot/clonezilla/
-#    deploy way "tmpfs" (default): the live filesystem goes to the web root
-sudo cp live/filesystem.squashfs            /var/www/html/clonezilla/
-#    deploy way "nfs": extract the WHOLE zip instead (it must contain live/filesystem.squashfs)
-sudo unzip clonezilla-live-*-amd64.zip -d /srv/nfs/clonezilla
+sudo cp -r amd64/* /var/lib/tftpboot/                                        # netboot tarball's amd64/
+sudo cp live/vmlinuz live/initrd.img /var/lib/tftpboot/clonezilla/           # from the Clonezilla zip
+sudo cp live/filesystem.squashfs /var/www/html/clonezilla/                   # tmpfs way
+sudo unzip clonezilla-live-*-amd64.zip -d /srv/nfs/clonezilla                # nfs way (whole zip)
 sudo pxe-ctl grub                           # re-apply our grub.cfg (the tarball ships its own) + permissions
-# 3. the image: made with ocs-sr on the source disk (see clonezilla-pxe-clone-guide.md), or copied here
+```
+
+## What it does NOT do: the image
+The Clonezilla image is never created or copied for you: capture it on the source disk (see
+[clonezilla-pxe-clone-guide.md](clonezilla-pxe-clone-guide.md)) or copy it into the image folder:
+```
+sudo pxe-ctl clone nvme0n2                  # capture disk nvme0n2 of THIS server as IMAGE_NAME and export it
+# the same by hand:
 sudo ocs-sr -q2 -c -j2 -z9p -sfsck -senc -p true savedisk cri-golden nvme0n2   # -> /home/partimag/cri-golden/
 sudo pxe-ctl nfs                            # (re-)export /home/partimag read-only over NFS
 ```
+`pxe-ctl clone <disk> [--yes] [--force]` (also the **Clone Image** button and its disk field on the GUI's
+Manage tab) runs exactly that `ocs-sr` command and then re-exports `IMAGE_DIR` over NFS. Before it starts it
+refuses a disk that is not a whole disk, is mounted or holds swap (an OS disk that is running must be imaged
+from Clonezilla Live instead), and an `IMAGE_NAME` that already exists (delete it, or use `--force` / the
+"Overwrite" checkbox, which removes the old image first). The disk itself is only read. `--yes` runs without
+the confirmation prompt (`-batch` instead of `-c`; the GUI always uses it). Only one clone runs at a time, and
+`IMAGE_DIR` has to be `/home/partimag`, where `ocs-sr` saves images.
 **The target disk is erased.** Which image and disk are used: `IMAGE_NAME` (default `cri-golden`) and
 `TARGET_DISK` (default `nvme0n1`) in the config. By default (`AUTO_INSTALL=1`) the restore entry is the
 default PXE menu entry: a PXE-booted host is erased and restored without any question (use
@@ -79,7 +103,9 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ./target/release/pxe-installer-gui
 ```
 Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
-**Install** (packages, services stopped) then **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
+**Install** (packages, downloads of the netboot files and Clonezilla Live, services stopped) then **Start**.
+The Install button always uses the default download URLs; to use other ones, run the CLI `install` with
+`NETBOOT_URL` / `CLONEZILLA_URL` first. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
 and streams the output with a progress bar; the temp file is deleted afterwards. Manage tab: host status,
 installed hosts, bindings, re-export images, switch the deploy way, reinstall / mark installed / bind / unbind.
@@ -87,14 +113,14 @@ installed hosts, bindings, re-export images, switch the deploy way, reinstall / 
 ## CLI
 ```
 pxe-installer print-config > pxe.conf       # edit it (IMAGE_NAME, TARGET_DISK, network)
-sudo ./pxe-installer install --config pxe.conf                  # packages + directories, services stopped
+sudo ./pxe-installer install --config pxe.conf                  # packages, downloads, directories; services stopped
 sudo ./pxe-installer start   --config pxe.conf --dry-run        # show everything it would do/write
 sudo ./pxe-installer start   --config pxe.conf
 
 sudo pxe-ctl status                          # per-host: installed / pending / waiting
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
-sudo pxe-ctl grub | nfs | mode [tmpfs|nfs] | stop
+sudo pxe-ctl grub | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | stop
   # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```

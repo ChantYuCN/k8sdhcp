@@ -2,9 +2,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::{is_disk_name, is_hostname, is_mac, normalize_mac, Config, RootMode};
+use crate::config::{is_disk_name, is_hostname, is_image_name, is_mac, normalize_mac, Config, RootMode};
 use crate::render;
-use crate::util::{mkdir, now_iso, probe, run, run_soft, write_file, Ctx};
+use crate::util::{mkdir, now_iso, output, probe, run, run_soft, write_file, Ctx};
 
 const LEASES: &str = "/var/lib/misc/dnsmasq.leases";
 
@@ -213,6 +213,109 @@ fn switch_mode(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// `ocs-sr` saves images under this folder (Clonezilla's default `ocsroot`), so IMAGE_DIR has to be it.
+const OCS_ROOT: &str = "/home/partimag";
+/// Only one capture at a time (the GUI button could be clicked twice). /run is a tmpfs: gone after a reboot.
+const CLONE_LOCK: &str = "/run/pxe-installer-clone.lock";
+
+/// Arguments of `ctl clone`: (disk name without /dev/, --yes, --force).
+fn parse_clone_args(args: &[String]) -> Result<(String, bool, bool), String> {
+    let mut disk: Option<String> = None;
+    let (mut yes, mut force) = (false, false);
+    for a in args {
+        match a.as_str() {
+            "--yes" => yes = true,
+            "--force" => force = true,
+            d if !d.starts_with('-') && disk.is_none() => disk = Some(d.trim_start_matches("/dev/").to_string()),
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    let disk = disk.ok_or("disk name required, e.g.: pxe-ctl clone nvme0n2 [--yes] [--force]")?;
+    if !is_disk_name(&disk) {
+        return Err(format!("'{disk}' is not a disk name (use e.g. sda or nvme0n2, lowercase letters and digits)"));
+    }
+    Ok((disk, yes, force))
+}
+
+/// Removes the clone lock when the capture ends (or fails).
+struct CloneLock;
+impl Drop for CloneLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(CLONE_LOCK);
+    }
+}
+
+/// `ctl clone <disk> [--yes] [--force]` - capture <disk> of THIS host into the Clonezilla image repository as
+/// IMAGE_NAME (`ocs-sr savedisk`, partclone + parallel zstd) and re-export the repository over NFS, so the
+/// targets can restore it. The disk is only read, but it must be idle: not mounted, no swap, not in use.
+/// `--yes` runs without the confirmation prompt (the GUI has no terminal for it); `--force` deletes an
+/// existing image of the same name first (without it that is an error).
+fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
+    let (disk, yes, force) = parse_clone_args(args)?;
+    if !is_image_name(&c.image_name) {
+        return Err(format!("IMAGE_NAME '{}' is not valid", c.image_name));
+    }
+    if c.image_dir != OCS_ROOT {
+        return Err(format!(
+            "IMAGE_DIR is {} but ocs-sr saves images under {OCS_ROOT}: set IMAGE_DIR={OCS_ROOT} (or make {OCS_ROOT} a bind mount of it) and re-run start",
+            c.image_dir
+        ));
+    }
+    if !probe("sh", &["-c", "command -v ocs-sr >/dev/null"]) {
+        return Err("ocs-sr not found: install the Clonezilla tools first (pxe-installer install)".into());
+    }
+
+    // the source must be a whole disk and idle (lsblk lists the mount points of its partitions/LVM children too)
+    let dev = format!("/dev/{disk}");
+    let kind = output("lsblk", &["-dno", "TYPE", &dev]).map_err(|_| format!("{dev} is not a block device"))?;
+    if kind != "disk" {
+        return Err(format!("{dev} is a '{kind}', not a whole disk (use e.g. sda, not sda1)"));
+    }
+    let used = output("lsblk", &["-nro", "MOUNTPOINTS", &dev])
+        .or_else(|_| output("lsblk", &["-nro", "MOUNTPOINT", &dev]))
+        .map_err(|e| format!("cannot check whether {dev} is in use: {e}"))?;
+    let used: Vec<&str> = used.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if !used.is_empty() {
+        return Err(format!(
+            "{dev} is in use ({}): it must be unmounted and not hold swap; boot Clonezilla Live to image an OS disk that is running",
+            used.join(", ")
+        ));
+    }
+
+    // take the lock BEFORE touching the image: a second click must not delete what the first one is writing
+    let _lock = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(CLONE_LOCK)
+        .map(|_| CloneLock)
+        .map_err(|_| format!("another clone is running (or a stale lock: remove {CLONE_LOCK} if none is)"))?;
+
+    let image = format!("{}/{}", c.image_dir, c.image_name);
+    if Path::new(&image).exists() {
+        if !force {
+            return Err(format!(
+                "image {image} already exists: delete it first (sudo rm -rf {image}) or use --force / the \"Overwrite\" box"
+            ));
+        }
+        fs::remove_dir_all(&image).map_err(|e| format!("remove old image {image}: {e}"))?;
+        println!("removed the old image {image}");
+    }
+
+    println!("Capturing {dev} as image {} (this takes a while, depending on the used data)", c.image_name);
+    let confirm = if yes { "-batch" } else { "-c" };
+    run(
+        Ctx { dry: false },
+        "ocs-sr",
+        &["-q2", confirm, "-j2", "-z9p", "-sfsck", "-senc", "-p", "true", "savedisk", &c.image_name, &disk],
+    )?;
+
+    // make the new image visible to the targets
+    crate::install::setup_nfs(&c, Ctx { dry: false })?;
+    println!("Image {image} captured and exported over NFS ({}).", c.image_dir);
+    crate::install::report_missing(&c);
+    Ok(())
+}
+
 /// `pxe-installer ctl <subcommand> ...`
 pub fn ctl(args: &[String]) -> Result<(), String> {
     let c = Config::load_runtime();
@@ -266,6 +369,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
+        Some("clone") => clone_image(c, &args[1..]),
         Some("binds") => {
             for l in read_hosts(&c) {
                 println!("{HOST_PREFIX}{l}");
@@ -279,7 +383,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -405,6 +509,20 @@ mod tests {
         assert_eq!(c.root_mode, RootMode::Tmpfs);
         assert!(switch_mode(c.clone(), Some("bogus")).is_err());
         assert!(switch_mode(c, None).is_ok()); // just prints the current way
+    }
+
+    #[test]
+    fn clone_args() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(parse_clone_args(&a(&["sda"])).unwrap(), ("sda".to_string(), false, false));
+        assert_eq!(parse_clone_args(&a(&["/dev/nvme0n2", "--yes", "--force"])).unwrap(), ("nvme0n2".to_string(), true, true));
+        assert_eq!(parse_clone_args(&a(&["--yes", "sdb"])).unwrap().0, "sdb");
+        assert!(parse_clone_args(&a(&[])).is_err()); // no disk
+        assert!(parse_clone_args(&a(&["--yes"])).is_err());
+        assert!(parse_clone_args(&a(&["sda; reboot"])).is_err()); // not a disk name
+        assert!(parse_clone_args(&a(&["sda", "sdb"])).is_err()); // two disks
+        assert!(parse_clone_args(&a(&["sda", "--bogus"])).is_err());
+        assert!(parse_clone_args(&a(&["Sda"])).is_err());
     }
 
     #[test]

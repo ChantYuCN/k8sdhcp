@@ -385,7 +385,7 @@ fn install_tab() -> gtk::Widget {
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
-    install_btn.set_tooltip_text(Some("Installs dnsmasq + Apache and creates the directories; services are left stopped"));
+    install_btn.set_tooltip_text(Some("Installs dnsmasq, Apache, NFS and the Clonezilla tools, downloads the Ubuntu netboot files and Clonezilla Live and puts them in place; services are left stopped"));
     let start_btn = gtk::Button::with_label("Start PXE server");
     start_btn.add_css_class("suggested-action");
     start_btn.set_tooltip_text(Some("Writes the network/DHCP/PXE menu/NFS configuration and starts dnsmasq + Apache + NFS"));
@@ -430,7 +430,7 @@ fn install_tab() -> gtk::Widget {
         // Install needs none of the form values (and so none of its validation)
         let ui = ui.clone();
         install_btn.connect_clicked(move |_| {
-            run_installer("install", 4.0, "PXE packages installed; services stopped. Click \"Start PXE server\" next.", Ok(Config::default()), &ui)
+            run_installer("install", 6.0, "PXE packages installed, netboot files and Clonezilla Live downloaded; services stopped. Click \"Start PXE server\" next.", Ok(Config::default()), &ui)
         });
     }
     start_btn.connect_clicked(move |_| {
@@ -529,10 +529,44 @@ fn manage_tab() -> gtk::Widget {
     inner.append(&fields);
     inner.append(&actions);
 
+    // Clone Image: capture a disk of THIS server into the Clonezilla image repository (ocs-sr savedisk),
+    // then re-export the repository over NFS so the targets can restore it.
+    let clone_disk = entry("");
+    clone_disk.set_placeholder_text(Some("source disk of this server, e.g. sda or nvme0n2"));
+    let clone_force = gtk::CheckButton::with_label("Overwrite the existing image");
+    clone_force.set_tooltip_text(Some("Without this an image that already exists is never replaced"));
+    let clone_btn = gtk::Button::with_label("Clone Image");
+    clone_btn.add_css_class("suggested-action");
+    clone_btn.set_tooltip_text(Some(
+        "Runs: ocs-sr -q2 -j2 -z9p -sfsck -senc -p true savedisk <image name> <disk>, then re-exports the image folder over NFS. \
+         The disk must be idle (not mounted, no swap). It is only read. This takes a long time for a big disk.",
+    ));
+    {
+        let (log, clone_disk, clone_force) = (log.clone(), clone_disk.clone(), clone_force.clone());
+        clone_btn.connect_clicked(move |_| {
+            let d = text_of(&clone_disk).trim().trim_start_matches("/dev/").to_string();
+            if d.is_empty() {
+                append(&log, "Enter the source disk name first (e.g. sda).\n");
+                return;
+            }
+            // --yes: no confirmation prompt (there is no terminal to answer it)
+            let mut args = vec!["clone".to_string(), d, "--yes".to_string()];
+            if clone_force.is_active() {
+                args.push("--force".to_string());
+            }
+            run_ctl(args, &log);
+        });
+    }
+    let clone_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    clone_row.append(&clone_disk);
+    clone_row.append(&clone_force);
+    clone_row.append(&clone_btn);
+
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     margins(&outer, 10);
     outer.append(&top);
     outer.append(&framed("Per-host actions", &inner));
+    outer.append(&framed("Clone image (capture a disk of this server for the targets)", &clone_row));
     outer.append(&log_sw);
     outer.upcast()
 }

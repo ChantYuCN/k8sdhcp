@@ -1,16 +1,20 @@
-//! The `install` command installs dnsmasq + Apache + NFS and creates the directories; the `start` command
-//! writes their PXE configuration and starts them. Targets boot Clonezilla Live over PXE and restore a
-//! Clonezilla image (served over NFS) onto their disk.
-//! It does NOT download or copy the netboot files, Clonezilla Live or the image - the admin places those.
+//! The `install` command installs dnsmasq + Apache + NFS + the Clonezilla tools, creates the directories and
+//! (unless --no-download) downloads the Ubuntu netboot files and Clonezilla Live and puts them in place;
+//! the `start` command writes the PXE configuration and starts the services. Targets boot Clonezilla Live
+//! over PXE and restore a Clonezilla image (served over NFS) onto their disk.
+//! It does NOT create or copy the Clonezilla image - the admin captures it (ocs-sr savedisk) or copies it.
 use std::fs;
 use std::path::Path;
 
-use crate::config::{Config, RootMode};
+use crate::config::{url_filename, Config, RootMode};
 use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
-const PACKAGES: [&str; 4] = ["dnsmasq", "apache2", "curl", "nfs-kernel-server"];
+/// dnsmasq/apache2/nfs-kernel-server are the PXE services; curl/unzip/tar fetch and unpack the downloads;
+/// clonezilla/partclone/pigz/zstd let this host capture the golden image (`ocs-sr savedisk`).
+const PACKAGES: [&str; 9] =
+    ["dnsmasq", "apache2", "curl", "nfs-kernel-server", "clonezilla", "partclone", "pigz", "zstd", "unzip"];
 
 /// Where the admin puts Clonezilla Live: kernel + initrd always under the TFTP root; the live filesystem
 /// depends on the deploy way (ROOT_MODE): under the web root (tmpfs: the target fetches it over HTTP into
@@ -67,9 +71,116 @@ fn prepare(c: &Config, validate: bool) -> Result<Ctx, String> {
     Ok(ctx)
 }
 
-/// `install`: packages + directories only. Nothing is configured and the services are left stopped;
-/// `start` does the configuration.
+/// Make `file` available in `c.download_dir` (downloaded with curl unless a valid copy is already there,
+/// so re-running `install` does not download again) and check that it really is an archive. A mirror that
+/// answers with a web page instead of the file is the usual way this fails; such a file is deleted.
+fn download(c: &Config, ctx: Ctx, url: &str) -> Result<String, String> {
+    let name = url_filename(url).ok_or_else(|| format!("cannot derive a file name from {url}"))?;
+    let dest = format!("{}/{name}", c.download_dir);
+    mkdir(ctx, &c.download_dir)?;
+    if !ctx.dry && Path::new(&dest).exists() {
+        if archive_ok(&dest) {
+            println!("already downloaded: {dest}");
+            return Ok(dest);
+        }
+        warn(&format!("{dest} is not a valid archive - downloading it again"));
+        let _ = fs::remove_file(&dest);
+    }
+    let part = format!("{dest}.part");
+    run(ctx, "curl", &["-fL", "--retry", "3", "--connect-timeout", "30", "-o", &part, url])?;
+    if !ctx.dry {
+        fs::rename(&part, &dest).map_err(|e| format!("rename {part}: {e}"))?;
+        if !archive_ok(&dest) {
+            let _ = fs::remove_file(&dest);
+            return Err(format!(
+                "{url} did not return a valid archive (wrong URL, or the mirror sent a web page); try another URL or mirror"
+            ));
+        }
+    }
+    Ok(dest)
+}
+
+/// True if `path` is a readable .zip or .tar.gz (by extension).
+fn archive_ok(path: &str) -> bool {
+    if path.ends_with(".zip") {
+        probe("unzip", &["-tq", path])
+    } else {
+        probe("tar", &["-tzf", path])
+    }
+}
+
+/// Download the Ubuntu netboot tarball and put its `amd64/` folder (bootx64.efi, grubx64.efi, grub/ ...) into
+/// the TFTP root. The tarball ships its own grub/grub.cfg; a menu that `start` already wrote is put back.
+fn install_netboot(c: &Config, ctx: Ctx) -> Result<(), String> {
+    let file = download(c, ctx, &c.netboot_url)?;
+    let tmp = format!("{}/netboot-extract", c.download_dir);
+    if ctx.dry {
+        println!("[dry-run] extract {file} and copy its amd64/ folder into {}/", c.tftp_root);
+        return Ok(());
+    }
+    let _ = fs::remove_dir_all(&tmp);
+    mkdir(ctx, &tmp)?;
+    run(ctx, "tar", &["-xzf", &file, "-C", &tmp])?;
+    let src = if Path::new(&format!("{tmp}/amd64")).is_dir() {
+        format!("{tmp}/amd64")
+    } else if Path::new(&format!("{tmp}/bootx64.efi")).exists() {
+        tmp.clone()
+    } else {
+        return Err(format!("{file} has no amd64/ folder (or bootx64.efi): is it the Ubuntu netboot tarball?"));
+    };
+
+    let grub = format!("{}/grub/grub.cfg", c.tftp_root);
+    let keep = fs::read_to_string(&grub).ok().filter(|t| t.contains(render::GRUB_MARK));
+    mkdir(ctx, &c.tftp_root)?;
+    run(ctx, "cp", &["-a", &format!("{src}/."), &format!("{}/", c.tftp_root)])?;
+    if let Some(menu) = keep {
+        write_file(ctx, &grub, &menu, 0o644, false)?;
+        println!("kept the PXE menu {grub} that `start` wrote");
+    }
+    let _ = fs::remove_dir_all(&tmp);
+    if !Path::new(&format!("{}/bootx64.efi", c.tftp_root)).exists() {
+        warn(&format!("{}/bootx64.efi is missing after extracting {file}", c.tftp_root));
+    }
+    Ok(())
+}
+
+/// Download Clonezilla Live and place it for both deploy ways, so `pxe-ctl mode` can switch at any time:
+/// the whole zip is extracted into `live_root` (the NFS-root way exports it), vmlinuz + initrd.img go to
+/// the TFTP root, and live/filesystem.squashfs to the web root (the tmpfs way downloads it from there).
+fn install_clonezilla(c: &Config, ctx: Ctx) -> Result<(), String> {
+    let file = download(c, ctx, &c.clonezilla_url)?;
+    if ctx.dry {
+        println!("[dry-run] unzip {file} into {}", c.live_root);
+        println!("[dry-run] copy live/vmlinuz, live/initrd.img -> {}/ and live/filesystem.squashfs -> {}/", cz_tftp_dir(c), cz_web_dir(c));
+        return Ok(());
+    }
+    mkdir(ctx, &c.live_root)?;
+    run(ctx, "unzip", &["-q", "-o", &file, "-d", &c.live_root])?;
+    let live = format!("{}/live", c.live_root);
+    for f in ["vmlinuz", "initrd.img", "filesystem.squashfs"] {
+        if !Path::new(&format!("{live}/{f}")).is_file() {
+            return Err(format!("{file} has no live/{f}: is it the Clonezilla Live amd64 zip?"));
+        }
+    }
+    mkdir(ctx, &cz_tftp_dir(c))?;
+    mkdir(ctx, &cz_web_dir(c))?;
+    for (f, dir) in [("vmlinuz", cz_tftp_dir(c)), ("initrd.img", cz_tftp_dir(c)), ("filesystem.squashfs", cz_web_dir(c))] {
+        let to = format!("{dir}/{f}");
+        run(ctx, "cp", &["-f", &format!("{live}/{f}"), &to])?;
+        set_mode(&to, 0o644)?;
+    }
+    Ok(())
+}
+
+/// `install`: packages, directories and (unless DOWNLOAD=0) the downloaded boot files. Nothing is
+/// configured and the services are left stopped; `start` does the configuration.
 pub fn install(c: &Config) -> Result<(), String> {
+    if c.download {
+        let errs = c.validate_download();
+        if !errs.is_empty() {
+            return Err(format!("invalid download settings:\n  - {}\n(or use --no-download)", errs.join("\n  - ")));
+        }
+    }
     let ctx = prepare(c, false)?;
 
     step("Installing packages");
@@ -79,13 +190,20 @@ pub fn install(c: &Config) -> Result<(), String> {
     run(ctx, "apt-get", &apt)?;
 
     step("Creating directories");
-    let mut dirs = vec![c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone()];
-    if c.root_mode == RootMode::Nfs {
-        dirs.push(c.live_root.clone());
-    }
-    for dir in dirs {
+    for dir in [c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone(), c.live_root.clone()] {
         mkdir(ctx, &dir)?;
         set_mode_soft(ctx, &dir, 0o755);
+    }
+
+    if c.download {
+        step("Downloading and extracting the Ubuntu netboot files");
+        install_netboot(c, ctx)?;
+        step("Downloading and extracting Clonezilla Live");
+        install_clonezilla(c, ctx)?;
+        // the tftp tree must be root-owned/read-only except the done/ marker dir (same as `pxe-ctl grub`)
+        ctl::fix_perms(c, ctx)?;
+    } else {
+        println!("downloads are switched off (DOWNLOAD=0): copy the netboot files and Clonezilla Live yourself");
     }
 
     step("Checking installation");
@@ -99,6 +217,9 @@ pub fn install(c: &Config) -> Result<(), String> {
     step("Stopping services");
     run(ctx, "systemctl", &["stop", "dnsmasq", "apache2", "nfs-server"])?;
 
+    if !ctx.dry {
+        report_missing(c);
+    }
     println!(
         "\nPXE packages are installed and the services are stopped.\n\
          Next: set the network/DHCP/target options and click \"Start PXE server\" (or: pxe-installer start)."
@@ -133,7 +254,8 @@ pub fn start(c: &Config) -> Result<(), String> {
 
     println!(
         "\nPXE services are running ({} / {}-{}).\n\n\
-         NEXT STEPS (manual - this installer does not download or copy these files):\n\
+         NEXT STEPS (`install` places the boot files and Clonezilla Live itself unless it was run with\n\
+         --no-download; do the numbered copy steps only for what the notes above report as missing):\n\
          \x20 1. UEFI boot files (bootx64.efi, grubx64.efi, grub/, ... from the Ubuntu netboot tarball)\n\
          \x20      -> copy into {}/\n\
          \x20 2. Clonezilla Live (the amd64 zip from clonezilla.org). Deploy way: {}\n\
