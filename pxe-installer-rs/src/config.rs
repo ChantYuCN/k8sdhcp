@@ -11,6 +11,32 @@ pub struct Binding {
     pub hostname: String,
 }
 
+/// How the target gets its Clonezilla Live system (the PXE deploy way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootMode {
+    /// filesystem.squashfs is downloaded over HTTP into the target's RAM; the root is a tmpfs overlay
+    Tmpfs,
+    /// the target mounts the extracted Clonezilla Live folder from the server over NFS (diskless root)
+    Nfs,
+}
+
+impl RootMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RootMode::Tmpfs => "tmpfs",
+            RootMode::Nfs => "nfs",
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<RootMode, String> {
+        match v.trim().to_lowercase().as_str() {
+            "tmpfs" | "ram" | "http" => Ok(RootMode::Tmpfs),
+            "nfs" => Ok(RootMode::Nfs),
+            other => Err(format!("ROOT_MODE: '{other}' is not valid (use tmpfs or nfs)")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub iface: String,
@@ -22,7 +48,8 @@ pub struct Config {
     pub upstream_dns: String,
     pub set_static_ip: bool,
     pub only_known_hosts: bool,
-    /// PXE menu restores the Clonezilla image by default (ERASES the target disk); off = interactive Clonezilla
+    /// PXE menu restores the Clonezilla image by default (ERASES the target disk, no question asked);
+    /// off = the default entry is interactive Clonezilla and the restore entry must be selected by hand
     pub auto_install: bool,
     /// Hostname given to a restored host that has no hostname bound to its MAC
     pub target_hostname: String,
@@ -32,6 +59,10 @@ pub struct Config {
     pub image_dir: String,
     /// Disk of the target the image is restored onto (name under /dev, e.g. nvme0n1)
     pub target_disk: String,
+    /// How the target gets Clonezilla Live: `Tmpfs` (HTTP download into RAM) or `Nfs` (NFS root)
+    pub root_mode: RootMode,
+    /// NFS mode: the extracted Clonezilla Live zip (it contains live/filesystem.squashfs), exported read-only
+    pub live_root: String,
     pub tftp_root: String,
     pub web_root: String,
     pub hosts_file: String,
@@ -56,6 +87,8 @@ impl Default for Config {
             image_name: "cri-golden".into(),
             image_dir: "/home/partimag".into(),
             target_disk: "nvme0n1".into(),
+            root_mode: RootMode::Tmpfs,
+            live_root: "/srv/nfs/clonezilla".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
@@ -155,6 +188,8 @@ impl Config {
             "IMAGE_NAME" => self.image_name = v.into(),
             "IMAGE_DIR" => self.image_dir = v.trim_end_matches('/').into(),
             "TARGET_DISK" => self.target_disk = v.trim_start_matches("/dev/").into(),
+            "ROOT_MODE" => self.root_mode = RootMode::parse(v)?,
+            "LIVE_ROOT" => self.live_root = v.trim_end_matches('/').into(),
             // settings of older (autoinstall / ISO based) versions: accepted and ignored
             "TARGET_USER" | "TARGET_PASSWORD" | "ISO_NAME" | "NFS_ROOT" => {}
             "RELEASE_URL" | "NETBOOT_TAR" | "ISO_FILE" => {}
@@ -282,11 +317,13 @@ impl Config {
         if !is_disk_name(&self.target_disk) {
             errs.push("TARGET_DISK must be a disk name such as nvme0n1 or sda (no /dev/ prefix)".to_string());
         }
-        // image_dir is put on the target's kernel command line (inside a quoted mount command)
-        if !self.image_dir.bytes().all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)) {
-            errs.push("IMAGE_DIR may only contain letters, digits, '/', '.', '_' and '-'".to_string());
+        // image_dir and live_root are put on the target's kernel command line
+        for (label, p) in [("IMAGE_DIR", &self.image_dir), ("LIVE_ROOT", &self.live_root)] {
+            if !p.bytes().all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)) {
+                errs.push(format!("{label} may only contain letters, digits, '/', '.', '_' and '-'"));
+            }
         }
-        for p in [&self.tftp_root, &self.web_root, &self.image_dir, &self.hosts_file] {
+        for p in [&self.tftp_root, &self.web_root, &self.image_dir, &self.live_root, &self.hosts_file] {
             if !p.starts_with('/') {
                 errs.push(format!("path '{p}' must be absolute"));
             }
@@ -341,6 +378,8 @@ impl Config {
             format!("IMAGE_NAME={}", self.image_name),
             format!("IMAGE_DIR={}", self.image_dir),
             format!("TARGET_DISK={}", self.target_disk),
+            format!("ROOT_MODE={}", self.root_mode.as_str()),
+            format!("LIVE_ROOT={}", self.live_root),
         ];
         for h in &self.bindings {
             lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
@@ -353,11 +392,13 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\n",
+            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\nROOT_MODE={}\nLIVE_ROOT={}\n",
             self.tftp_root, self.web_root, self.image_dir, self.image_name, self.target_disk, self.hosts_file,
             self.server_ip, self.prefix,
             u8::from(self.auto_install),
-            self.target_hostname
+            self.target_hostname,
+            self.root_mode.as_str(),
+            self.live_root
         )
     }
 
@@ -408,6 +449,31 @@ mod tests {
         for k in ["RELEASE_URL", "ISO_NAME", "NFS_ROOT", "TARGET_USER", "TARGET_PASSWORD"] {
             assert!(c.set(k, "x").is_ok(), "{k}");
         }
+    }
+
+    #[test]
+    fn root_mode_parse_and_roundtrip() {
+        assert_eq!(good().root_mode, RootMode::Tmpfs); // default: live system in RAM
+        assert_eq!(RootMode::parse("NFS").unwrap(), RootMode::Nfs);
+        assert_eq!(RootMode::parse("ram").unwrap(), RootMode::Tmpfs);
+        assert!(RootMode::parse("squashfs").is_err());
+        let mut c = good();
+        assert!(c.set("ROOT_MODE", "bogus").is_err());
+        c.set("ROOT_MODE", "nfs").unwrap();
+        c.set("LIVE_ROOT", "/srv/cz/").unwrap();
+        assert_eq!((c.root_mode, c.live_root.as_str()), (RootMode::Nfs, "/srv/cz"));
+        // survives both the temp config the GUI writes and the runtime config the helpers read
+        let path = std::env::temp_dir().join(format!("pxe-mode-{}.conf", std::process::id()));
+        for text in [c.to_conf(), c.runtime_conf()] {
+            std::fs::write(&path, text).unwrap();
+            let mut d = Config::default();
+            d.load_file(path.to_str().unwrap()).unwrap();
+            assert_eq!((d.root_mode, d.live_root.as_str()), (RootMode::Nfs, "/srv/cz"));
+        }
+        let _ = std::fs::remove_file(&path);
+        // live_root ends up on the kernel command line
+        c.live_root = "/srv/my clonezilla".into();
+        assert!(c.validate().iter().any(|e| e.contains("LIVE_ROOT")));
     }
 
     #[test]

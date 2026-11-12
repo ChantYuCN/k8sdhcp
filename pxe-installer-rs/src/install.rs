@@ -5,20 +5,48 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, RootMode};
 use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
 const PACKAGES: [&str; 4] = ["dnsmasq", "apache2", "curl", "nfs-kernel-server"];
 
-/// Where the admin puts Clonezilla Live: kernel + initrd under the TFTP root, the live filesystem under
-/// the web root (the target fetches it over HTTP).
+/// Where the admin puts Clonezilla Live: kernel + initrd always under the TFTP root; the live filesystem
+/// depends on the deploy way (ROOT_MODE): under the web root (tmpfs: the target fetches it over HTTP into
+/// RAM) or inside the extracted Clonezilla Live folder `live_root` (nfs: the target mounts it).
 fn cz_tftp_dir(c: &Config) -> String {
     format!("{}/clonezilla", c.tftp_root)
 }
 fn cz_web_dir(c: &Config) -> String {
     format!("{}/clonezilla", c.web_root)
+}
+fn squashfs_path(c: &Config) -> String {
+    match c.root_mode {
+        RootMode::Tmpfs => format!("{}/filesystem.squashfs", cz_web_dir(c)),
+        RootMode::Nfs => format!("{}/live/filesystem.squashfs", c.live_root),
+    }
+}
+
+/// Print a note for every file the chosen deploy way needs that is not there yet (the admin copies them
+/// by hand, so these are notes, not errors). The image itself is reported by `setup_nfs`.
+pub fn report_missing(c: &Config) {
+    for (path, what) in [
+        (format!("{}/bootx64.efi", c.tftp_root), "UEFI boot files from the netboot tarball"),
+        (format!("{}/vmlinuz", cz_tftp_dir(c)), "Clonezilla Live vmlinuz"),
+        (format!("{}/initrd.img", cz_tftp_dir(c)), "Clonezilla Live initrd.img"),
+        (
+            squashfs_path(c),
+            match c.root_mode {
+                RootMode::Tmpfs => "Clonezilla Live filesystem.squashfs",
+                RootMode::Nfs => "extract the whole Clonezilla Live zip into LIVE_ROOT",
+            },
+        ),
+    ] {
+        if !Path::new(&path).exists() {
+            println!("note: {path} not present yet ({what})");
+        }
+    }
 }
 
 /// `validate`: `start` needs a complete, valid config; `install` only needs the paths.
@@ -51,7 +79,11 @@ pub fn install(c: &Config) -> Result<(), String> {
     run(ctx, "apt-get", &apt)?;
 
     step("Creating directories");
-    for dir in [c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone()] {
+    let mut dirs = vec![c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone()];
+    if c.root_mode == RootMode::Nfs {
+        dirs.push(c.live_root.clone());
+    }
+    for dir in dirs {
         mkdir(ctx, &dir)?;
         set_mode_soft(ctx, &dir, 0o755);
     }
@@ -104,10 +136,11 @@ pub fn start(c: &Config) -> Result<(), String> {
          NEXT STEPS (manual - this installer does not download or copy these files):\n\
          \x20 1. UEFI boot files (bootx64.efi, grubx64.efi, grub/, ... from the Ubuntu netboot tarball)\n\
          \x20      -> copy into {}/\n\
-         \x20 2. Clonezilla Live (the amd64 zip from clonezilla.org, folder live/):\n\
-         \x20      vmlinuz, initrd.img          -> {}/\n\
-         \x20      filesystem.squashfs          -> {}/\n\
+         \x20 2. Clonezilla Live (the amd64 zip from clonezilla.org). Deploy way: {}\n\
+         \x20      live/vmlinuz, live/initrd.img  -> {}/\n\
+         {}\
          \x20    then run:  sudo pxe-ctl grub   (re-applies our grub.cfg and file permissions)\n\
+         \x20    (switch the deploy way later with:  sudo pxe-ctl mode tmpfs|nfs)\n\
          \x20 3. The Clonezilla image \"{}\" (made with ocs-sr savedisk) -> {}/{}/\n\
          \x20    exported read-only over NFS; after adding or changing it run:  sudo pxe-ctl nfs\n\n\
          Then boot the target in UEFI mode with \"PXE IPv4\" as first boot device. It restores the image\n\
@@ -120,8 +153,18 @@ pub fn start(c: &Config) -> Result<(), String> {
         c.dhcp_start,
         c.dhcp_end,
         c.tftp_root,
+        match c.root_mode {
+            RootMode::Tmpfs => "tmpfs (the live system is downloaded into the target's RAM)",
+            RootMode::Nfs => "nfs (the target mounts the live system from the server)",
+        },
         cz_tftp_dir(c),
-        cz_web_dir(c),
+        match c.root_mode {
+            RootMode::Tmpfs => format!("       live/filesystem.squashfs       -> {}/\n", cz_web_dir(c)),
+            RootMode::Nfs => format!(
+                "       the WHOLE zip, extracted       -> {}/   (it must contain live/filesystem.squashfs)\n",
+                c.live_root
+            ),
+        },
         c.image_name,
         c.image_dir,
         c.image_name,
@@ -277,18 +320,8 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
         if !cgi.contains("bad mac") {
             warn("pxe-done CGI not working");
         }
-        // not errors: the admin copies these by hand after the install
-        for (path, what) in [
-            (format!("{}/bootx64.efi", c.tftp_root), "UEFI boot files from the netboot tarball"),
-            (format!("{}/vmlinuz", cz_tftp_dir(c)), "Clonezilla Live vmlinuz"),
-            (format!("{}/initrd.img", cz_tftp_dir(c)), "Clonezilla Live initrd.img"),
-            (format!("{}/filesystem.squashfs", cz_web_dir(c)), "Clonezilla Live filesystem.squashfs"),
-            (format!("{}/{}", c.image_dir, c.image_name), "the Clonezilla image"),
-        ] {
-            if !Path::new(&path).exists() {
-                println!("note: {path} not present yet ({what})");
-            }
-        }
+        // not errors: the admin copies these by hand after the install (the image is noted by setup_nfs)
+        report_missing(c);
     }
     Ok(())
 }
@@ -297,24 +330,25 @@ const NFS_MOUNTD_PORT: &str = "20048";
 const FSTAB: &str = "/etc/fstab";
 const FSTAB_MARK: &str = "# pxe-installer";
 
-/// Export the Clonezilla image repository (`image_dir`) read-only to the PXE subnet; the target mounts it
-/// on /home/partimag. The images themselves may not exist yet; `pxe-ctl nfs` re-runs this (and reports
-/// whether the configured image is there) once they have been added.
+/// Export over NFS, read-only, to the PXE subnet: the Clonezilla image repository (`image_dir`, mounted by
+/// the target on /home/partimag) and, in the `nfs` deploy way, the extracted Clonezilla Live folder
+/// (`live_root`, the diskless root of the target). The files themselves may not exist yet; `pxe-ctl nfs`
+/// and `pxe-ctl mode` re-run this (and report what is missing) once they have been added.
 pub fn setup_nfs(c: &Config, ctx: Ctx) -> Result<(), String> {
     let net = c.network().map(|n| format!("{n}/{}", c.prefix)).unwrap_or_default();
+    let opts = "ro,no_subtree_check,no_root_squash,async";
 
     mkdir(ctx, &c.image_dir)?;
+    let mut exports = format!("{} {net}({opts})\n", c.image_dir);
+    if c.root_mode == RootMode::Nfs {
+        mkdir(ctx, &c.live_root)?;
+        exports.push_str(&format!("{} {net}({opts})\n", c.live_root));
+    }
     drop_old_iso_mount(ctx)?;
 
     // pin mountd so the firewall rule is predictable (the Clonezilla initrd mounts with NFSv3)
     write_file(ctx, "/etc/nfs.conf.d/pxe-installer.conf", &format!("[mountd]\nport={NFS_MOUNTD_PORT}\n"), 0o644, false)?;
-    write_file(
-        ctx,
-        "/etc/exports.d/pxe-installer.exports",
-        &format!("{} {net}(ro,no_subtree_check,no_root_squash,async)\n", c.image_dir),
-        0o644,
-        false,
-    )?;
+    write_file(ctx, "/etc/exports.d/pxe-installer.exports", &exports, 0o644, false)?;
     run(ctx, "exportfs", &["-ra"])?;
 
     if !ctx.dry && !Path::new(&format!("{}/{}", c.image_dir, c.image_name)).is_dir() {

@@ -1,5 +1,5 @@
 //! Text templates for every generated file. Pure functions, unit-tested.
-use crate::config::Config;
+use crate::config::{Config, RootMode};
 use crate::util::fill;
 
 /// PXE settings; /etc/dnsmasq.conf stays the global config and loads this via conf-dir.
@@ -37,11 +37,17 @@ dhcp-boot=tag:efi64,bootx64.efi,@SERVER_IP@,@SERVER_IP@
 log-dhcp
 ";
 
-// Clonezilla Live over PXE. The kernel and initrd come from the TFTP root (/clonezilla/), the live
-// filesystem is fetched over HTTP (fetch=), and the image repository is mounted over NFS on
-// /home/partimag. After the restore Clonezilla runs post.sh (generated per MAC by `cgi-seed`): it gives
+// Clonezilla Live over PXE. The kernel and initrd come from the TFTP root (/clonezilla/); the image
+// repository is mounted over NFS on /home/partimag. The live system itself is delivered in one of two
+// ways (@ROOT_ARGS@, see ROOT_MODE): `fetch=` downloads filesystem.squashfs over HTTP into the target's RAM
+// (root = tmpfs overlay), or `netboot=nfs nfsroot=` mounts the extracted Clonezilla Live folder from the
+// server over NFS (diskless root, no RAM copy). After the restore Clonezilla runs post.sh (generated per MAC by `cgi-seed`): it gives
 // the clone its own hostname / machine-id / SSH host keys and calls pxe-done, which creates the marker
 // that makes the guard at the top of this file skip the host on its next PXE boot.
+//
+// There is no `ip=` argument on purpose: with fetch= the live-boot initramfs configures the network with
+// DHCP by itself. `ip=dhcp` is read as a device name ("ip: can't find device 'dhcp'") and an empty `ip=`
+// becomes `ip=frommedia` ("ip: can't find device 'frommedia'"); either way eth0 gets no address.
 //
 // Notes on the syntax: the `\"` pairs put literal double quotes on the kernel command line, which
 // Clonezilla needs for values that contain spaces. `&&` and `;` are GRUB operators, so every command is
@@ -58,12 +64,12 @@ fi
 
 menuentry "Clonezilla Live (interactive - nothing is changed automatically)" {
     echo "Loading Clonezilla Live..."
-    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt ip=dhcp net.ifnames=0 keyboard-layouts= locales= fetch=http://@SERVER_IP@/clonezilla/filesystem.squashfs ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_live_run=\"ocs-live-general\" ocs_live_extra_param=\"\" ocs_live_batch=\"no\" ---
+    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts= locales= @ROOT_ARGS@ ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_live_run=\"ocs-live-general\" ocs_live_extra_param=\"\" ocs_live_batch=\"no\" ---
     initrd /clonezilla/initrd.img
 }
 menuentry "Restore @IMAGE_NAME@ to /dev/@TARGET_DISK@ (ERASES THE DISK)" {
     echo "Loading Clonezilla Live..."
-    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt ip=dhcp net.ifnames=0 keyboard-layouts= locales= fetch=http://@SERVER_IP@/clonezilla/filesystem.squashfs ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_live_run=\"ocs-sr -g auto -e1 auto -e2 -batch -r -j2 -scr -p true restoredisk @IMAGE_NAME@ @TARGET_DISK@\" ocs_live_extra_param=\"\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
+    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts= locales= @ROOT_ARGS@ ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_live_run=\"ocs-sr -g auto -e1 auto -e2 -batch -r -j2 -scr -p true restoredisk @IMAGE_NAME@ @TARGET_DISK@\" ocs_live_extra_param=\"\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
     initrd /clonezilla/initrd.img
 }
 menuentry "Boot from local disk" {
@@ -166,10 +172,15 @@ pub fn dnsmasq_conf(c: &Config) -> String {
 pub fn grub_cfg(c: &Config) -> String {
     // entries: 0 = interactive Clonezilla, 1 = restore the image, 2 = local disk
     let default = if c.auto_install { "1" } else { "0" };
+    let root_args = match c.root_mode {
+        RootMode::Tmpfs => format!("fetch=http://{}/clonezilla/filesystem.squashfs", c.server_ip),
+        RootMode::Nfs => format!("netboot=nfs nfsroot={}:{}", c.server_ip, c.live_root),
+    };
     fill(
         GRUB,
         &[
             ("DEFAULT", default),
+            ("ROOT_ARGS", root_args.as_str()),
             ("SERVER_IP", c.server_ip.as_str()),
             ("IMAGE_DIR", c.image_dir.as_str()),
             ("IMAGE_NAME", c.image_name.as_str()),
@@ -251,6 +262,8 @@ mod tests {
         // kernel + initrd from the TFTP root, live filesystem over HTTP, image repository over NFS
         assert!(s.contains("linux /clonezilla/vmlinuz boot=live"));
         assert!(s.contains("initrd /clonezilla/initrd.img"));
+        // no ip= argument at all: ip=dhcp and an empty ip= (-> frommedia) both break the network setup
+        assert!(!s.contains(" ip="));
         assert!(s.contains("fetch=http://192.168.5.1/clonezilla/filesystem.squashfs"));
         assert!(s.contains(r#"ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 192.168.5.1:/home/partimag /home/partimag\""#));
         // the restore command targets the configured image and disk
@@ -266,13 +279,33 @@ mod tests {
         for l in s.lines().filter(|l| l.trim_start().starts_with("linux ")) {
             assert!(!l.contains("&&") && !l.contains(';') && !l.contains('|'), "{l}");
         }
-        // default entry: restore (1) with auto_install, interactive (0) without
+        // default entry: restore (1) with auto_install (the default), interactive (0) without
         assert!(s.contains("set default=1"));
         let mut c = cfg();
         c.auto_install = false;
         assert!(grub_cfg(&c).contains("set default=0"));
         // no unreplaced @PLACEHOLDER@
         assert!(!s.contains('@'));
+    }
+
+    #[test]
+    fn grub_root_mode_tmpfs_or_nfs() {
+        // default: the live system is downloaded into RAM
+        let s = grub_cfg(&cfg());
+        assert_eq!(s.matches("fetch=http://192.168.5.1/clonezilla/filesystem.squashfs").count(), 2);
+        assert!(!s.contains("netboot=nfs") && !s.contains("nfsroot="));
+
+        // NFS root: both entries mount the extracted Clonezilla Live folder, nothing is downloaded
+        let mut c = cfg();
+        c.root_mode = RootMode::Nfs;
+        c.live_root = "/srv/nfs/clonezilla".into();
+        let s = grub_cfg(&c);
+        assert_eq!(s.matches("netboot=nfs nfsroot=192.168.5.1:/srv/nfs/clonezilla ").count(), 2);
+        assert!(!s.contains("fetch="));
+        // the image repository is still mounted, and the rest of the entries is unchanged
+        assert!(s.contains("192.168.5.1:/home/partimag /home/partimag"));
+        assert!(s.contains("restoredisk cri-golden nvme0n1"));
+        assert!(!s.contains(" ip=") && !s.contains('@'));
     }
 
     #[test]

@@ -11,7 +11,7 @@ pxe-installer - UEFI PXE server that deploys a Clonezilla image (dnsmasq + Apach
 USAGE
   pxe-installer install [--config FILE] [--dry-run] [options]   install packages + create directories, services left stopped
   pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
-  pxe-installer ctl list | status | stop | grub | nfs | reinstall <mac> | done <mac>
+  pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
@@ -23,6 +23,10 @@ INSTALL/START OPTIONS  (flags override --config; same names as config keys)
   --image-name NAME          (Clonezilla image restored onto the targets; default cri-golden)
   --image-dir DIR            (image repository, NFS-exported read-only; default /home/partimag)
   --target-disk DISK         (disk of the target that is ERASED and restored; default nvme0n1)
+  --root-mode tmpfs|nfs      (deploy way: tmpfs = Clonezilla Live downloaded into the target's RAM over HTTP,
+                              nfs = the target mounts Clonezilla Live from the server; default tmpfs;
+                              switch later with `pxe-ctl mode tmpfs|nfs`)
+  --live-root DIR            (nfs way: extracted Clonezilla Live zip, exported read-only; default /srv/nfs/clonezilla)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
 ";
@@ -46,6 +50,16 @@ TARGET_HOSTNAME=ubuntu-node
 IMAGE_NAME=cri-golden
 IMAGE_DIR=/home/partimag
 TARGET_DISK=nvme0n1
+
+# How the target gets Clonezilla Live (the PXE deploy way); switch later with: sudo pxe-ctl mode tmpfs|nfs
+#   tmpfs = live/filesystem.squashfs is downloaded over HTTP into the target's RAM (needs ~4 GB RAM)
+#   nfs   = the target mounts the extracted Clonezilla Live zip from LIVE_ROOT over NFS (diskless root)
+ROOT_MODE=tmpfs
+LIVE_ROOT=/srv/nfs/clonezilla
+
+# 1 = the restore entry is the default: a PXE-booted host is ERASED and restored without any question
+# 0 = the PXE menu starts interactive Clonezilla; pick the restore entry by hand (safer for first tests)
+AUTO_INSTALL=1
 
 # fixed MAC -> IP bindings (repeat HOST=)
 # HOST=aa:bb:cc:dd:ee:01,192.168.5.11,node01

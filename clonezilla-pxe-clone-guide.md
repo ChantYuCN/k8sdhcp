@@ -55,11 +55,13 @@ DHCP_START=192.168.5.100
 DHCP_END=192.168.5.200
 SET_STATIC_IP=1
 ONLY_KNOWN_HOSTS=1
-AUTO_INSTALL=0                    # first tests: the default PXE entry is interactive Clonezilla
+AUTO_INSTALL=0                    # 1 (default) = restore without any question; 0 = interactive Clonezilla (use 0 for first tests)
 TARGET_HOSTNAME=ubuntu-node       # hostname of a host that has none bound to its MAC
 IMAGE_NAME=cri-golden             # folder inside IMAGE_DIR
 IMAGE_DIR=/home/partimag
 TARGET_DISK=nvme0n1               # ERASED on the target
+ROOT_MODE=tmpfs                   # deploy way: tmpfs (live system into RAM) or nfs (NFS root), see section 4
+LIVE_ROOT=/srv/nfs/clonezilla     # nfs way only: the extracted Clonezilla Live zip
 HOST=<target-mac>,192.168.5.20,node20
 ```
 
@@ -115,14 +117,27 @@ UEFI boot files from it are used: `bootx64.efi`, `grubx64.efi`, `grub/`).
 ```bash
 sudo cp -r amd64/* /var/lib/tftpboot/                      # from the netboot tarball
 cd ~/cz && unzip clonezilla-live-*-amd64.zip -d czlive
-sudo cp czlive/live/vmlinuz czlive/live/initrd.img /var/lib/tftpboot/clonezilla/
-sudo cp czlive/live/filesystem.squashfs /var/www/html/clonezilla/
-sudo chmod 644 /var/www/html/clonezilla/filesystem.squashfs
-sudo pxe-ctl grub          # re-apply our grub.cfg (the tarball ships its own) and file permissions
+sudo cp czlive/live/vmlinuz czlive/live/initrd.img /var/lib/tftpboot/clonezilla/   # always: kernel + initrd via TFTP
 ```
 
-The kernel and initrd go through TFTP. The target downloads `filesystem.squashfs` over HTTP into RAM, so
-give the target at least 4 GiB of RAM.
+Then the live system itself, depending on the **deploy way** (`ROOT_MODE`):
+
+| Way | What the target does | You provide |
+| --- | --- | --- |
+| `tmpfs` (default) | downloads `filesystem.squashfs` over HTTP into **RAM**; root is a tmpfs overlay | `sudo cp czlive/live/filesystem.squashfs /var/www/html/clonezilla/` (mode 644). Give the target at least 4 GiB of RAM. |
+| `nfs` | mounts the Clonezilla Live folder from the server over **NFS** as a diskless root (`netboot=nfs nfsroot=`), no RAM copy | `sudo mkdir -p /srv/nfs/clonezilla && sudo cp -a czlive/. /srv/nfs/clonezilla/` (the **whole** zip; `live/filesystem.squashfs` must be inside). It is exported read-only to the PXE subnet. |
+
+```bash
+sudo pxe-ctl grub          # re-apply our grub.cfg (the tarball ships its own) and file permissions
+sudo pxe-ctl mode          # show the current deploy way
+sudo pxe-ctl mode nfs      # switch (or: tmpfs); applies to the next PXE boot, no service restart
+```
+
+`pxe-ctl mode` rewrites `grub.cfg` and the NFS exports at once, and prints which files the chosen way is
+still missing. The same switch exists as two radio buttons on the GUI's Install tab and as buttons on the
+Manage tab. In both ways the image repository is mounted over NFS on `/home/partimag`. The NFS-root way keeps
+the target dependent on the server for the whole restore; it is the less tested of the two, so if the target
+stops in the initramfs, read `cat /boot.log` there and fall back to `tmpfs`.
 
 ## 5. What the Tool Generates
 
@@ -136,8 +151,12 @@ give the target at least 4 GiB of RAM.
   then `ocs_postrun1..3`: download `post.sh`, run it, reboot;
 - entry 2: boot from the local disk.
 
-`AUTO_INSTALL=1` makes entry 1 the default, `AUTO_INSTALL=0` makes entry 0 the default. Both Clonezilla
-entries mount `SERVER_IP:IMAGE_DIR` read-only on `/home/partimag` through `ocs_prerun`.
+`AUTO_INSTALL=1` (the default) makes entry 1 the default, `AUTO_INSTALL=0` makes entry 0 the default. Both Clonezilla
+entries mount `SERVER_IP:IMAGE_DIR` read-only on `/home/partimag` through `ocs_prerun`. The kernel arguments
+that deliver the live system depend on `ROOT_MODE`: `fetch=http://SERVER/clonezilla/filesystem.squashfs`
+(tmpfs) or `netboot=nfs nfsroot=SERVER:LIVE_ROOT` (nfs). There is deliberately no `ip=` argument: Clonezilla's
+live-boot initramfs reads `ip=dhcp` and an empty `ip=` as an interface name and leaves the NIC without an
+address; without it, it configures the network with DHCP itself.
 
 **The post-restore script** is generated per MAC by the `pxe-seed` CGI at
 `http://SERVER/cgi-bin/pxe-seed/<mac>/post.sh`. It finds the restored root filesystem on the target disk,
@@ -154,7 +173,8 @@ To change what happens after the restore, edit `POST_SCRIPT` in `src/render.rs` 
 
 ## 6. Run and Verify
 
-1. First test: keep `AUTO_INSTALL=0` and select the restore entry by hand on the target console. Watch the
+1. First test: set `AUTO_INSTALL=0` in `pxe.conf` (the default is 1) and re-run `start`, then select the
+   restore entry by hand on the target console. Watch the
    restore; for the very first run you can also run `ocs-sr` interactively from entry 0.
 2. Boot the target in **UEFI** mode with network first in the boot order. Test with Secure Boot disabled.
 3. Watch the server: `journalctl -fu dnsmasq` and `sudo tail -f /var/log/apache2/access.log`.
@@ -170,6 +190,7 @@ To change what happens after the restore, edit `POST_SCRIPT` in `src/render.rs` 
 | Symptom | Check |
 | --- | --- |
 | Clonezilla asks interactive questions | The arguments did not reach it. Run `cat /proc/cmdline` in the live shell and compare it with the entry in `grub.cfg` (the `\"` pairs must arrive as `"`). |
+| nfs way: initramfs cannot mount the root | `cat /boot.log`; from another host `showmount -e 192.168.5.1` must list `LIVE_ROOT`; check `ls LIVE_ROOT/live/filesystem.squashfs` on the server; switch back with `sudo pxe-ctl mode tmpfs`. |
 | `mount -t nfs` fails | `showmount -e 192.168.5.1` from the target; check `exportfs -v`, the firewall ports and that `nfs-server` is running. |
 | `ocs-sr` cannot find the image | `ls /home/partimag` in the live shell; `IMAGE_NAME` must be a folder in `IMAGE_DIR`; run `sudo pxe-ctl nfs` on the server. |
 | Restore is slow | Test a sequential `dd` read of an image file; check link speed with `ethtool <nic>`. |

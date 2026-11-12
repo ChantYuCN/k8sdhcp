@@ -8,8 +8,8 @@ already finished are skipped; MAC -> IP bindings supported. The CLI is std-only;
 
 ```text
 PXE server                                   target (UEFI, PXE first)
-  /home/partimag/<image>  --NFS (ro)-->       GRUB -> Clonezilla Live (kernel+initrd via TFTP,
-  clonezilla/filesystem.squashfs --HTTP-->      live filesystem via HTTP)
+  /home/partimag/<image>  --NFS (ro)-->       GRUB -> Clonezilla Live (kernel+initrd via TFTP; live system
+  clonezilla/filesystem.squashfs --HTTP-->      into RAM via HTTP (tmpfs) or mounted over NFS (nfs mode))
   cgi-bin/pxe-seed/<mac>/post.sh --HTTP-->    ocs-sr restoredisk <image> <disk>
   cgi-bin/pxe-done?mac=...      <--HTTP--     post.sh: hostname, machine-id, SSH keys -> pxe-done -> reboot
 ```
@@ -36,27 +36,53 @@ Clonezilla Live or the image - you place them yourself (`start` prints these ste
 ```
 # 1. UEFI boot files from the Ubuntu netboot tarball (amd64/*) into the TFTP root
 sudo cp -r amd64/* /var/lib/tftpboot/
-# 2. Clonezilla Live (clonezilla-live-*-amd64.zip, folder live/)
+# 2. Clonezilla Live (clonezilla-live-*-amd64.zip, folder live/); kernel + initrd always go to TFTP
 sudo cp live/vmlinuz live/initrd.img        /var/lib/tftpboot/clonezilla/
+#    deploy way "tmpfs" (default): the live filesystem goes to the web root
 sudo cp live/filesystem.squashfs            /var/www/html/clonezilla/
+#    deploy way "nfs": extract the WHOLE zip instead (it must contain live/filesystem.squashfs)
+sudo unzip clonezilla-live-*-amd64.zip -d /srv/nfs/clonezilla
 sudo pxe-ctl grub                           # re-apply our grub.cfg (the tarball ships its own) + permissions
 # 3. the image: made with ocs-sr on the source disk (see clonezilla-pxe-clone-guide.md), or copied here
 sudo ocs-sr -q2 -c -j2 -z9p -sfsck -senc -p true savedisk cri-golden nvme0n2   # -> /home/partimag/cri-golden/
 sudo pxe-ctl nfs                            # (re-)export /home/partimag read-only over NFS
 ```
 **The target disk is erased.** Which image and disk are used: `IMAGE_NAME` (default `cri-golden`) and
-`TARGET_DISK` (default `nvme0n1`) in the config. The restore entry is the default PXE menu entry
-(`AUTO_INSTALL=1`); with `AUTO_INSTALL=0` the default is an interactive Clonezilla Live.
+`TARGET_DISK` (default `nvme0n1`) in the config. By default (`AUTO_INSTALL=1`) the restore entry is the
+default PXE menu entry: a PXE-booted host is erased and restored without any question (use
+`ONLY_KNOWN_HOSTS=1` so only bound hosts are served). Set `AUTO_INSTALL=0` and re-run `start` for a menu
+that starts an interactive Clonezilla Live, where the restore entry has to be selected by hand (safer for
+first tests).
+
+## Deploy way: tmpfs or NFS root
+How a target gets the Clonezilla Live system itself (the image is always read over NFS):
+
+| `ROOT_MODE` | Live system | Target RAM | Needs on the server |
+| --- | --- | --- | --- |
+| `tmpfs` (default) | `live/filesystem.squashfs` is downloaded over HTTP into the target's RAM; the root is a tmpfs overlay (`fetch=` in `grub.cfg`) | about 4 GB or more | the squashfs in `<web-root>/clonezilla/` |
+| `nfs` | the target mounts the extracted Clonezilla Live zip over NFS as a diskless root (`netboot=nfs nfsroot=` in `grub.cfg`) | less (no RAM copy of the system) | the whole zip extracted into `LIVE_ROOT` (default `/srv/nfs/clonezilla`), exported read-only |
+
+Choose it with `ROOT_MODE=` / `--root-mode`, the radio buttons on the GUI's Install tab, or switch at any time
+without restarting anything:
+```
+sudo pxe-ctl mode            # show the current way
+sudo pxe-ctl mode nfs        # or: tmpfs   (also the Manage tab buttons)
+```
+The switch rewrites `grub.cfg`, updates the runtime config and adjusts the NFS exports (the live root is only
+exported in nfs mode). Hosts that are already booted are not affected; the next PXE boot uses the new way.
+The NFS way depends on the server for the whole restore and uses NFSv3 (mountd is pinned to port 20048 and
+opened in ufw). It has not been tested against every Clonezilla Live version: if the target does not boot,
+look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 
 ## GUI
 ```
 ./target/release/pxe-installer-gui
 ```
-Install tab: network/DHCP, default hostname, image name, target disk -> **Install** (packages, services
-stopped) then **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
+Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
+**Install** (packages, services stopped) then **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
 and streams the output with a progress bar; the temp file is deleted afterwards. Manage tab: host status,
-installed hosts, bindings, re-export images, reinstall / mark installed / bind / unbind.
+installed hosts, bindings, re-export images, switch the deploy way, reinstall / mark installed / bind / unbind.
 
 ## CLI
 ```
@@ -68,7 +94,7 @@ sudo ./pxe-installer start   --config pxe.conf
 sudo pxe-ctl status                          # per-host: installed / pending / waiting
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
-sudo pxe-ctl grub | nfs | stop
+sudo pxe-ctl grub | nfs | mode [tmpfs|nfs] | stop
   # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
@@ -97,7 +123,8 @@ PXE boot. Use `ONLY_KNOWN_HOSTS=1` so only hosts you bound get a DHCP answer at 
 (optional netplan static IP) -> free port 53 -> `/etc/dnsmasq.d/pxe.conf` (global `/etc/dnsmasq.conf` is
 kept, only ensured to load `conf-dir=/etc/dnsmasq.d`) + MAC bindings -> `grub.cfg` (Clonezilla entries)
 -> copies itself to `/usr/local/sbin/pxe-installer`, writes the `pxe-ctl` wrapper -> CGIs and Apache conf ->
-NFS export of `IMAGE_DIR` (read-only, PXE subnet) -> start services, ufw rules, checks.
+NFS export of `IMAGE_DIR` (and `LIVE_ROOT` in nfs mode; read-only, PXE subnet) -> start services, ufw rules,
+checks.
 
 ## Security
 PXE, TFTP, NFS and the callbacks are unauthenticated: use an isolated provisioning network with no other

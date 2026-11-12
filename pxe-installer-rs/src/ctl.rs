@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::config::{is_disk_name, is_hostname, is_mac, normalize_mac, Config};
+use crate::config::{is_disk_name, is_hostname, is_mac, normalize_mac, Config, RootMode};
 use crate::render;
 use crate::util::{mkdir, now_iso, probe, run, run_soft, write_file, Ctx};
 
@@ -187,6 +187,32 @@ fn status(c: &Config) {
     println!("\nstate: installed = marker present (PXE skips it) | pending = has a DHCP lease, no done callback yet | waiting = bound, never seen");
 }
 
+/// `ctl mode [tmpfs|nfs]` - show or switch the PXE deploy way. The switch is applied at once: the runtime
+/// config is updated, grub.cfg is rewritten and the NFS exports are adjusted (the live root is only
+/// exported in nfs mode). Hosts that are already booted into Clonezilla are not affected; the next PXE
+/// boot uses the new way. No service restart is needed.
+fn switch_mode(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
+    let Some(wanted) = wanted else {
+        println!("PXE deploy way: {}", c.root_mode.as_str());
+        return Ok(());
+    };
+    c.set("ROOT_MODE", wanted)?;
+    let ctx = Ctx { dry: false };
+    write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
+    write_grub(&c, ctx)?;
+    crate::install::setup_nfs(&c, ctx)?;
+    println!(
+        "PXE deploy way is now: {} ({})",
+        c.root_mode.as_str(),
+        match c.root_mode {
+            RootMode::Tmpfs => "the live system is downloaded over HTTP into the target's RAM",
+            RootMode::Nfs => "the target mounts the live system from the server over NFS",
+        }
+    );
+    crate::install::report_missing(&c);
+    Ok(())
+}
+
 /// `pxe-installer ctl <subcommand> ...`
 pub fn ctl(args: &[String]) -> Result<(), String> {
     let c = Config::load_runtime();
@@ -236,8 +262,10 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             // run after adding or changing a Clonezilla image: (re-)export the image repository
             crate::install::setup_nfs(&c, Ctx { dry: false })?;
             println!("Clonezilla image repository {} exported read-only (image: {})", c.image_dir, c.image_name);
+            crate::install::report_missing(&c);
             Ok(())
         }
+        Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
         Some("binds") => {
             for l in read_hosts(&c) {
                 println!("{HOST_PREFIX}{l}");
@@ -251,7 +279,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -367,6 +395,16 @@ mod tests {
         assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:02"), None);
         assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:09"), None);
         assert!(bind(&c, "aa:bb:cc:dd:ee:03", "192.168.5.13", "Bad_Name", false).is_err());
+    }
+
+    #[test]
+    fn mode_switch_rejects_unknown_way() {
+        // validated before anything is written (the real switch needs root and the PXE server)
+        let mut c = Config::default();
+        assert!(c.set("ROOT_MODE", "bogus").is_err());
+        assert_eq!(c.root_mode, RootMode::Tmpfs);
+        assert!(switch_mode(c.clone(), Some("bogus")).is_err());
+        assert!(switch_mode(c, None).is_ok()); // just prints the current way
     }
 
     #[test]
