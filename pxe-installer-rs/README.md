@@ -30,30 +30,32 @@ sudo apt install libgtk-4-dev build-essential pkg-config curl  # GUI only
 Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) and
 `target/release/pxe-installer-gui` (GUI; keep it in the same folder as `pxe-installer`).
 
-## What `install` downloads and places
+## What `install` does, and the files you copy by hand
 `install` installs the packages (dnsmasq, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
-`clonezilla partclone pigz zstd`) and, unless `DOWNLOAD=0` / `--no-download`, downloads two archives into
-`DOWNLOAD_DIR` (default `/var/cache/pxe-installer`; a valid copy there is not downloaded again), checks that
-they are real archives, and extracts them:
+`clonezilla partclone pigz zstd`), creates the directories and leaves the services stopped. **It downloads
+nothing.** At the end (in the terminal and in the GUI log) it lists the files you copy by hand and where they
+go, using your configured paths. The default ones:
 
-| Download (config key) | Default | Placed in |
-| --- | --- | --- |
-| Ubuntu netboot tarball (`NETBOOT_URL`) | `https://releases.ubuntu.com/26.04/ubuntu-26.04.1-netboot-amd64.tar.gz` | its `amd64/` folder (`bootx64.efi`, `grubx64.efi`, `grub/` ...) -> the TFTP root `/var/lib/tftpboot/` |
-| Clonezilla Live zip (`CLONEZILLA_URL`) | `https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.zip/download?use_mirror=twds` | `live/vmlinuz`, `live/initrd.img` -> `/var/lib/tftpboot/clonezilla/`; `live/filesystem.squashfs` -> `/var/www/html/clonezilla/`; the whole zip -> `LIVE_ROOT` (`/srv/nfs/clonezilla`) |
+| File you obtain | Copy it to |
+| --- | --- |
+| Ubuntu netboot tarball (e.g. `ubuntu-26.04.1-netboot-amd64.tar.gz` from releases.ubuntu.com) | the **content** of its `amd64/` folder (`bootx64.efi`, `grubx64.efi`, `grub/` ...) -> the TFTP root `/var/lib/tftpboot/` |
+| Clonezilla Live amd64 zip (e.g. `clonezilla-live-3.3.3-37-amd64.zip` from clonezilla.org) | `live/vmlinuz` and `live/initrd.img` -> `/var/lib/tftpboot/clonezilla/` (always) |
+| | `live/filesystem.squashfs` -> `/var/www/html/clonezilla/` (deploy way **tmpfs**) |
+| | the **whole** zip content -> `LIVE_ROOT`, `/srv/nfs/clonezilla` (deploy way **nfs**) |
 
-Clonezilla Live is placed for both deploy ways, so `pxe-ctl mode` can switch at any time. The netboot tarball
-ships its own `grub/grub.cfg`; a PXE menu that `start` already wrote is put back after extracting, and the
-tree is made root-owned/read-only again (except the `done/` marker folder). Change the versions or mirrors
-with `NETBOOT_URL=` / `CLONEZILLA_URL=` (or `--netboot-url` / `--clonezilla-url`); the file name is taken from
-the URL (for SourceForge's `.../<file>.zip/download` links, the segment before `/download`). The downloads
-need internet access on the server; with `--no-download` copy the files yourself:
 ```
-sudo cp -r amd64/* /var/lib/tftpboot/                                        # netboot tarball's amd64/
-sudo cp live/vmlinuz live/initrd.img /var/lib/tftpboot/clonezilla/           # from the Clonezilla zip
-sudo cp live/filesystem.squashfs /var/www/html/clonezilla/                   # tmpfs way
-sudo unzip clonezilla-live-*-amd64.zip -d /srv/nfs/clonezilla                # nfs way (whole zip)
-sudo pxe-ctl grub                           # re-apply our grub.cfg (the tarball ships its own) + permissions
+tar -xzf ubuntu-*-netboot-amd64.tar.gz
+sudo cp -r amd64/* /var/lib/tftpboot/
+unzip clonezilla-live-*-amd64.zip -d czlive
+sudo cp czlive/live/vmlinuz czlive/live/initrd.img /var/lib/tftpboot/clonezilla/
+sudo cp czlive/live/filesystem.squashfs /var/www/html/clonezilla/        # tmpfs way
+sudo cp -a czlive/. /srv/nfs/clonezilla/                                  # nfs way (whole zip content)
+sudo pxe-ctl grub     # after `start`, and after every copy into the TFTP root (see below)
 ```
+Copy the files for the deploy way(s) you use; `pxe-ctl mode tmpfs|nfs` switches between them. The netboot
+tarball ships its own `grub/grub.cfg`, which overwrites ours when you copy it after `start`: run
+`sudo pxe-ctl grub` again, it rewrites our menu and fixes the file permissions. `install` and `start`
+print a note for every file that is still missing.
 
 ## What it does NOT do: the image
 The Clonezilla image is never created or copied for you: capture it on the source disk (see
@@ -103,9 +105,8 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ./target/release/pxe-installer-gui
 ```
 Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
-**Install** (packages, downloads of the netboot files and Clonezilla Live, services stopped) then **Start**.
-The Install button always uses the default download URLs; to use other ones, run the CLI `install` with
-`NETBOOT_URL` / `CLONEZILLA_URL` first. It validates with the same code as the CLI, writes a mode-600 temp config, runs
+**Install** (packages, directories, services stopped) -> **copy the netboot files and Clonezilla Live by
+hand** to the folders the log lists -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
 and streams the output with a progress bar; the temp file is deleted afterwards. Manage tab: host status,
 installed hosts, bindings, re-export images, switch the deploy way, reinstall / mark installed / bind / unbind.
@@ -113,7 +114,7 @@ installed hosts, bindings, re-export images, switch the deploy way, reinstall / 
 ## CLI
 ```
 pxe-installer print-config > pxe.conf       # edit it (IMAGE_NAME, TARGET_DISK, network)
-sudo ./pxe-installer install --config pxe.conf                  # packages, downloads, directories; services stopped
+sudo ./pxe-installer install --config pxe.conf                  # packages + directories; lists the files to copy by hand
 sudo ./pxe-installer start   --config pxe.conf --dry-run        # show everything it would do/write
 sudo ./pxe-installer start   --config pxe.conf
 

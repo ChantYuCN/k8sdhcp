@@ -63,14 +63,6 @@ pub struct Config {
     pub root_mode: RootMode,
     /// NFS mode: the extracted Clonezilla Live zip (it contains live/filesystem.squashfs), exported read-only
     pub live_root: String,
-    /// `install` downloads and places the netboot files and Clonezilla Live (off = the admin copies them)
-    pub download: bool,
-    /// Ubuntu netboot tarball (its amd64/ folder goes into the TFTP root)
-    pub netboot_url: String,
-    /// Clonezilla Live amd64 zip (kernel + initrd -> TFTP, filesystem.squashfs -> web root, whole zip -> live_root)
-    pub clonezilla_url: String,
-    /// Where the downloaded archives are kept (a re-run does not download them again)
-    pub download_dir: String,
     pub tftp_root: String,
     pub web_root: String,
     pub hosts_file: String,
@@ -97,10 +89,6 @@ impl Default for Config {
             target_disk: "nvme0n1".into(),
             root_mode: RootMode::Tmpfs,
             live_root: "/srv/nfs/clonezilla".into(),
-            download: true,
-            netboot_url: "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-netboot-amd64.tar.gz".into(),
-            clonezilla_url: "https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.zip/download?use_mirror=twds".into(),
-            download_dir: "/var/cache/pxe-installer".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
@@ -145,27 +133,6 @@ pub fn is_image_name(n: &str) -> bool {
         && n.len() <= 64
         && !n.starts_with('.')
         && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
-}
-
-/// An http(s) URL without whitespace, quotes or control characters (it is handed to curl as one argument).
-pub fn is_url(u: &str) -> bool {
-    (u.starts_with("http://") || u.starts_with("https://"))
-        && u.len() <= 1000
-        && u.bytes().all(|c| c.is_ascii_graphic() && c != b'"' && c != b'\'' && c != b'\\')
-}
-
-/// File name a download is saved as: the last path segment, ignoring the query. SourceForge style links
-/// end in `/download`, so the segment before it is used then.
-pub fn url_filename(u: &str) -> Option<String> {
-    let path = u.split(['?', '#']).next()?;
-    let rest = path.split_once("://")?.1;
-    let mut segs: Vec<&str> = rest.split('/').skip(1).filter(|s| !s.is_empty()).collect();
-    if segs.last() == Some(&"download") {
-        segs.pop();
-    }
-    let name = *segs.last()?;
-    let ok = !name.starts_with('.') && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c));
-    ok.then(|| name.to_string())
 }
 
 /// Disk name under /dev (nvme0n1, sda, vda ...).
@@ -223,10 +190,8 @@ impl Config {
             "TARGET_DISK" => self.target_disk = v.trim_start_matches("/dev/").into(),
             "ROOT_MODE" => self.root_mode = RootMode::parse(v)?,
             "LIVE_ROOT" => self.live_root = v.trim_end_matches('/').into(),
-            "DOWNLOAD" => self.download = parse_bool(v)?,
-            "NETBOOT_URL" => self.netboot_url = v.into(),
-            "CLONEZILLA_URL" => self.clonezilla_url = v.into(),
-            "DOWNLOAD_DIR" => self.download_dir = v.trim_end_matches('/').into(),
+            // the installer no longer downloads anything (the admin copies the files): accepted and ignored
+            "DOWNLOAD" | "NETBOOT_URL" | "CLONEZILLA_URL" | "DOWNLOAD_DIR" => {}
             // settings of older (autoinstall / ISO based) versions: accepted and ignored
             "TARGET_USER" | "TARGET_PASSWORD" | "ISO_NAME" | "NFS_ROOT" => {}
             "RELEASE_URL" | "NETBOOT_TAR" | "ISO_FILE" => {}
@@ -283,7 +248,7 @@ impl Config {
                 "--dry-run" => c.dry_run = true,
                 "--static-ip" => c.set_static_ip = true,
                 "--only-known-hosts" => c.only_known_hosts = true,
-                "--no-download" => c.download = false,
+                "--no-download" => {} // nothing is downloaded any more; kept so old command lines still work
                 _ if a.starts_with("--") => {
                     let key = a[2..].replace('-', "_");
                     let val = args.get(i + 1).ok_or(format!("{a} needs a value"))?;
@@ -398,22 +363,6 @@ impl Config {
         errs
     }
 
-    /// Problems with the download settings; checked by `install` (only when DOWNLOAD is on).
-    pub fn validate_download(&self) -> Vec<String> {
-        let mut errs = Vec::new();
-        for (label, u) in [("NETBOOT_URL", &self.netboot_url), ("CLONEZILLA_URL", &self.clonezilla_url)] {
-            if !is_url(u) {
-                errs.push(format!("{label} must be an http(s) URL without spaces or quotes"));
-            } else if url_filename(u).is_none() {
-                errs.push(format!("{label}: cannot derive a file name from '{u}'"));
-            }
-        }
-        if !self.download_dir.starts_with('/') {
-            errs.push(format!("path '{}' must be absolute", self.download_dir));
-        }
-        errs
-    }
-
     /// KEY=VALUE text accepted by `load_file` (used by the GUI to hand settings to `install`).
     pub fn to_conf(&self) -> String {
         let flag = |v: bool| if v { "1" } else { "0" };
@@ -434,10 +383,6 @@ impl Config {
             format!("TARGET_DISK={}", self.target_disk),
             format!("ROOT_MODE={}", self.root_mode.as_str()),
             format!("LIVE_ROOT={}", self.live_root),
-            format!("DOWNLOAD={}", flag(self.download)),
-            format!("NETBOOT_URL={}", self.netboot_url),
-            format!("CLONEZILLA_URL={}", self.clonezilla_url),
-            format!("DOWNLOAD_DIR={}", self.download_dir),
         ];
         for h in &self.bindings {
             lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
@@ -535,33 +480,15 @@ mod tests {
     }
 
     #[test]
-    fn download_settings() {
-        // the defaults are valid and map to sensible file names
-        let c = good();
-        assert!(c.download && c.validate_download().is_empty(), "{:?}", c.validate_download());
-        assert_eq!(url_filename(&c.netboot_url).as_deref(), Some("ubuntu-26.04.1-netboot-amd64.tar.gz"));
-        // SourceForge style link: ".../<file>.zip/download?use_mirror=twds" -> <file>.zip
-        assert_eq!(url_filename(&c.clonezilla_url).as_deref(), Some("clonezilla-live-3.3.3-37-amd64.zip"));
-        assert_eq!(url_filename("http://h/a/b.tar.gz?x=1#y").as_deref(), Some("b.tar.gz"));
-        assert_eq!(url_filename("http://h/"), None);
-        assert_eq!(url_filename("https://h/..%2f"), None);
-        // bad URLs are refused
-        for bad in ["ftp://h/a.zip", "https://h/a b.zip", "https://h/a\".zip", "file.zip", "https://h/'x'.zip"] {
-            let mut c = good();
-            c.netboot_url = bad.into();
-            assert!(!c.validate_download().is_empty(), "{bad}");
+    fn download_settings_are_ignored() {
+        // older configs / command lines that mention the removed download feature still load
+        let mut c = good();
+        for k in ["DOWNLOAD", "NETBOOT_URL", "CLONEZILLA_URL", "DOWNLOAD_DIR"] {
+            assert!(c.set(k, "x").is_ok(), "{k}");
         }
-        // keys and flag
-        let mut c = good();
-        c.set("DOWNLOAD", "0").unwrap();
-        assert!(!c.download);
-        let args: Vec<String> = ["--no-download", "--netboot-url", "https://h/n.tar.gz"].iter().map(|s| s.to_string()).collect();
-        let c = Config::from_args(&args).unwrap();
-        assert!(!c.download);
-        assert_eq!(c.netboot_url, "https://h/n.tar.gz");
-        let mut c = good();
-        c.set("DOWNLOAD_DIR", "/var/cache/x/").unwrap();
-        assert_eq!(c.download_dir, "/var/cache/x");
+        let args: Vec<String> =
+            ["--no-download", "--netboot-url", "https://h/n.tar.gz"].iter().map(|s| s.to_string()).collect();
+        assert!(Config::from_args(&args).is_ok());
     }
 
     #[test]

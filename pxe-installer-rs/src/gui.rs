@@ -385,7 +385,7 @@ fn install_tab() -> gtk::Widget {
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
-    install_btn.set_tooltip_text(Some("Installs dnsmasq, Apache, NFS and the Clonezilla tools, downloads the Ubuntu netboot files and Clonezilla Live and puts them in place; services are left stopped"));
+    install_btn.set_tooltip_text(Some("Installs dnsmasq, Apache, NFS and the Clonezilla tools and creates the directories; services are left stopped. Nothing is downloaded: the log then lists the netboot and Clonezilla Live files you copy by hand, and where"));
     let start_btn = gtk::Button::with_label("Start PXE server");
     start_btn.add_css_class("suggested-action");
     start_btn.set_tooltip_text(Some("Writes the network/DHCP/PXE menu/NFS configuration and starts dnsmasq + Apache + NFS"));
@@ -430,7 +430,13 @@ fn install_tab() -> gtk::Widget {
         // Install needs none of the form values (and so none of its validation)
         let ui = ui.clone();
         install_btn.connect_clicked(move |_| {
-            run_installer("install", 6.0, "PXE packages installed, netboot files and Clonezilla Live downloaded; services stopped. Click \"Start PXE server\" next.", Ok(Config::default()), &ui)
+            run_installer(
+                "install",
+                4.0,
+                "Packages installed; services stopped. NOW COPY the netboot files and Clonezilla Live by hand (the log below lists where), then click \"Start PXE server\".",
+                Ok(Config::default()),
+                &ui,
+            )
         });
     }
     start_btn.connect_clicked(move |_| {
