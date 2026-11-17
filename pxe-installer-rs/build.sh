@@ -13,3 +13,4 @@ if [ "$1" != "--cli-only" ]; then
   cp target/x86_64-unknown-linux-musl/release/pxe-installer target/release/pxe-installer
 fi
 ls -l target/release/pxe-installer* target/x86_64-unknown-linux-musl/release/pxe-installer
+cp -r boot/* target/release/
