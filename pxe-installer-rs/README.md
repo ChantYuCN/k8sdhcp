@@ -37,10 +37,15 @@ nothing.** As its **last step** it unpacks the two files you put on the server b
 
 | Put it in (setting) | `install` then does |
 | --- | --- |
-| `/boot/netboot/ubuntu-*-netboot-amd64.tar.gz` (`NETBOOT_DIR`) | `tar -xzf` into a scratch folder, `cp -r amd64/.` into the TFTP root |
-| `/boot/livesystem/clonezilla-live-*-amd64.zip` (`LIVESYSTEM_DIR`) | `unzip` of `live/vmlinuz` + `live/initrd.img` into `<tftp-root>/clonezilla/`, and for the deploy way (`ROOT_MODE`): `live/filesystem.squashfs` into `<web-root>/clonezilla/` (tmpfs) or the whole zip into `LIVE_ROOT` (nfs) |
+| `netboot/ubuntu-*-netboot-amd64.tar.gz` (`NETBOOT_DIR`) | `tar -xzf` into a scratch folder, `cp -r amd64/.` into the TFTP root |
+| `livesystem/clonezilla-live-*-amd64.zip` (`LIVESYSTEM_DIR`) | `unzip` of `live/vmlinuz` + `live/initrd.img` into `<tftp-root>/clonezilla/`, and for the deploy way (`ROOT_MODE`): `live/filesystem.squashfs` into `<web-root>/clonezilla/` (tmpfs) or the whole zip into `LIVE_ROOT` (nfs) |
 
-then it writes `grub.cfg` and fixes the permissions (what `sudo pxe-ctl grub` does; the netboot tarball ships
+The two folders are **relative** by default, so they travel with the app: put `netboot/` and `livesystem/`
+in the same folder as `pxe-installer` / `pxe-installer-gui` (if not there, the current folder and then
+`/boot/netboot`, `/boot/livesystem` are tried; set an absolute path to pin one). `start` remembers the
+resolved paths for `pxe-ctl import`.
+
+Then it writes `grub.cfg` and fixes the permissions (what `sudo pxe-ctl grub` does; the netboot tarball ships
 its own `grub.cfg`). If several files match, the highest version is used. A missing file is a note, not an
 error. `start` unpacks the live system again if the deploy way chosen there needs files that are not there
 yet, and `sudo pxe-ctl import` repeats the whole step (for example after putting a newer zip into the
@@ -128,8 +133,8 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ./target/release/pxe-installer-gui
 ```
 Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
-**Install** (packages, directories, then the netboot tarball in `/boot/netboot` and the Clonezilla Live zip
-in `/boot/livesystem` are unpacked; services stopped) -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
+**Install** (packages, directories, then the netboot tarball in `netboot/` and the Clonezilla Live zip
+in `livesystem/` next to the program are unpacked; services stopped) -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
 and streams the output with a progress bar; the temp file is deleted afterwards. Manage tab: host status,
 installed hosts, bindings, re-export images, switch the deploy way, reinstall / mark installed / bind / unbind.

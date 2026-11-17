@@ -63,9 +63,11 @@ pub struct Config {
     pub root_mode: RootMode,
     /// NFS mode: the extracted Clonezilla Live zip (it contains live/filesystem.squashfs), exported read-only
     pub live_root: String,
-    /// Folder holding the Ubuntu netboot tarball (ubuntu-*-netboot-amd64.tar.gz); `install` unpacks it into the TFTP root
+    /// Folder holding the Ubuntu netboot tarball (ubuntu-*-netboot-amd64.tar.gz); `install` unpacks it into the
+    /// TFTP root. A relative name is looked up with `resolve_dir`.
     pub netboot_dir: String,
-    /// Folder holding the Clonezilla Live zip (clonezilla-live-*-amd64.zip); `install` unpacks what the deploy way needs
+    /// Folder holding the Clonezilla Live zip (clonezilla-live-*-amd64.zip); `install` unpacks what the deploy
+    /// way needs. A relative name is looked up with `resolve_dir`.
     pub livesystem_dir: String,
     pub tftp_root: String,
     pub web_root: String,
@@ -93,8 +95,8 @@ impl Default for Config {
             target_disk: "nvme0n1".into(),
             root_mode: RootMode::Tmpfs,
             live_root: "/srv/nfs/clonezilla".into(),
-            netboot_dir: "/boot/netboot".into(),
-            livesystem_dir: "/boot/livesystem".into(),
+            netboot_dir: "netboot".into(),
+            livesystem_dir: "livesystem".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
@@ -102,6 +104,26 @@ impl Default for Config {
             dry_run: false,
         }
     }
+}
+
+/// Where a folder setting (NETBOOT_DIR / LIVESYSTEM_DIR) really is. An absolute path is used as given. A
+/// relative one (the defaults `netboot` / `livesystem`) is looked up, first match wins: next to this program
+/// (so the folders travel with the app), then in the current folder, then under /boot. If none exists, the
+/// path next to the program is returned (and reported as missing).
+pub fn resolve_dir(dir: &str) -> String {
+    if dir.starts_with('/') || std::path::Path::new(dir).is_absolute() {
+        return dir.to_string();
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        candidates.push(exe_dir.join(dir));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(dir));
+    }
+    candidates.push(std::path::Path::new("/boot").join(dir));
+    let found = candidates.iter().find(|p| p.is_dir()).unwrap_or(&candidates[0]);
+    found.to_string_lossy().to_string()
 }
 
 pub fn normalize_mac(mac: &str) -> String {
@@ -412,8 +434,9 @@ impl Config {
             self.target_hostname,
             self.root_mode.as_str(),
             self.live_root,
-            self.netboot_dir,
-            self.livesystem_dir
+            // absolute: `pxe-ctl import` later runs from /usr/local/sbin, where "next to the program" is wrong
+            resolve_dir(&self.netboot_dir),
+            resolve_dir(&self.livesystem_dir)
         )
     }
 
@@ -494,7 +517,12 @@ mod tests {
     #[test]
     fn import_folders_default_set_and_roundtrip() {
         let mut c = good();
-        assert_eq!((c.netboot_dir.as_str(), c.livesystem_dir.as_str()), ("/boot/netboot", "/boot/livesystem"));
+        // relative by default: the folders travel with the app (see resolve_dir)
+        assert_eq!((c.netboot_dir.as_str(), c.livesystem_dir.as_str()), ("netboot", "livesystem"));
+        assert_eq!(resolve_dir("/data/nb"), "/data/nb"); // absolute: as given
+        // none exists: the path next to the program (it is then reported as missing)
+        let r = resolve_dir("no-such-folder-xyz");
+        assert!(r.ends_with("no-such-folder-xyz") && r != "no-such-folder-xyz", "{r}");
         c.set("NETBOOT_DIR", "/data/nb/").unwrap();
         c.set("LIVESYSTEM_DIR", "/data/live").unwrap();
         let path = std::env::temp_dir().join(format!("pxe-import-{}.conf", std::process::id()));

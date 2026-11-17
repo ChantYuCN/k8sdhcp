@@ -434,7 +434,7 @@ fn install_tab() -> gtk::Widget {
             run_installer(
                 "install",
                 7.0,
-                "Packages installed, netboot files and Clonezilla Live unpacked from /boot/netboot and /boot/livesystem; services stopped. Anything the log lists as missing must be copied by hand. Then click \"Start PXE server\".",
+                "Packages installed, netboot files and Clonezilla Live unpacked from the netboot and livesystem folders next to this program; services stopped. Anything the log lists as missing must be copied by hand. Then click \"Start PXE server\".",
                 Ok(Config::default()),
                 &ui,
             )

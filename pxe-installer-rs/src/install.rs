@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{Config, RootMode};
+use crate::config::{resolve_dir, Config, RootMode};
 use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
@@ -135,8 +135,9 @@ impl Drop for TempDir {
 /// `sudo tar -xzf ubuntu-*-netboot-amd64.tar.gz` + `sudo cp -r amd64/* <tftp root>/`, with the tarball taken
 /// from NETBOOT_DIR and unpacked in a scratch folder. Returns false (with a note) when there is no tarball.
 fn import_netboot(c: &Config, ctx: Ctx) -> Result<bool, String> {
-    let Some(tar) = find_archive(&c.netboot_dir, "ubuntu-", "-netboot-amd64.tar.gz") else {
-        println!("note: no ubuntu-*-netboot-amd64.tar.gz in {} (NETBOOT_DIR): copy the netboot files by hand", c.netboot_dir);
+    let dir = resolve_dir(&c.netboot_dir);
+    let Some(tar) = find_archive(&dir, "ubuntu-", "-netboot-amd64.tar.gz") else {
+        println!("note: no ubuntu-*-netboot-amd64.tar.gz in {dir} (NETBOOT_DIR): copy the netboot files by hand");
         return Ok(false);
     };
     println!("netboot tarball: {tar}");
@@ -157,8 +158,9 @@ fn import_netboot(c: &Config, ctx: Ctx) -> Result<bool, String> {
 /// Members are extracted straight to their destination (no scratch copy of the ~0.5 GB squashfs).
 /// Returns false (with a note) when there is no zip.
 fn import_live(c: &Config, ctx: Ctx) -> Result<bool, String> {
-    let Some(zip) = find_archive(&c.livesystem_dir, "clonezilla-live-", "-amd64.zip") else {
-        println!("note: no clonezilla-live-*-amd64.zip in {} (LIVESYSTEM_DIR): copy Clonezilla Live by hand", c.livesystem_dir);
+    let dir = resolve_dir(&c.livesystem_dir);
+    let Some(zip) = find_archive(&dir, "clonezilla-live-", "-amd64.zip") else {
+        println!("note: no clonezilla-live-*-amd64.zip in {dir} (LIVESYSTEM_DIR): copy Clonezilla Live by hand");
         return Ok(false);
     };
     println!("Clonezilla Live zip: {zip}");

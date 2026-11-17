@@ -32,8 +32,9 @@ INSTALL/START OPTIONS  (flags override --config; same names as config keys)
                               nfs = the target mounts Clonezilla Live from the server; default tmpfs;
                               switch later with `pxe-ctl mode tmpfs|nfs`)
   --live-root DIR            (nfs way: extracted Clonezilla Live zip, exported read-only; default /srv/nfs/clonezilla)
-  --netboot-dir DIR          (holds ubuntu-*-netboot-amd64.tar.gz, unpacked into the TFTP root by install; default /boot/netboot)
-  --livesystem-dir DIR       (holds clonezilla-live-*-amd64.zip, unpacked by install; default /boot/livesystem)
+  --netboot-dir DIR          (holds ubuntu-*-netboot-amd64.tar.gz, unpacked into the TFTP root by install;
+                              default `netboot`: relative = next to this program, else the current folder, else /boot)
+  --livesystem-dir DIR       (holds clonezilla-live-*-amd64.zip, unpacked by install; default `livesystem`, same lookup)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
 ";
@@ -69,8 +70,10 @@ LIVE_ROOT=/srv/nfs/clonezilla
 #   LIVESYSTEM_DIR  clonezilla-live-*-amd64.zip   : live/vmlinuz + live/initrd.img -> <tftp-root>/clonezilla/,
 #                   live/filesystem.squashfs -> <web-root>/clonezilla/ (tmpfs way), the whole zip -> LIVE_ROOT (nfs way)
 # then it writes grub.cfg (= sudo pxe-ctl grub). Repeat later with: sudo pxe-ctl import
-NETBOOT_DIR=/boot/netboot
-LIVESYSTEM_DIR=/boot/livesystem
+# A relative name is looked up next to the pxe-installer program, then in the current folder, then under /boot;
+# an absolute path (e.g. /boot/netboot) is used as given.
+NETBOOT_DIR=netboot
+LIVESYSTEM_DIR=livesystem
 
 # 1 = the restore entry is the default: a PXE-booted host is ERASED and restored without any question
 # 0 = the PXE menu starts interactive Clonezilla; pick the restore entry by hand (safer for first tests)
