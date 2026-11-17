@@ -13,9 +13,11 @@ USAGE
                                                                  + create directories, services left stopped; then it lists
                                                                  the netboot / Clonezilla Live files YOU copy by hand and where
   pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
-  pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
+  pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
                     | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
+                    (clone = interactive fsck of each partition, then ocs-sr, on this terminal;
+                     --yes = no prompts, --force = replace an existing image)
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
 
@@ -30,6 +32,8 @@ INSTALL/START OPTIONS  (flags override --config; same names as config keys)
                               nfs = the target mounts Clonezilla Live from the server; default tmpfs;
                               switch later with `pxe-ctl mode tmpfs|nfs`)
   --live-root DIR            (nfs way: extracted Clonezilla Live zip, exported read-only; default /srv/nfs/clonezilla)
+  --netboot-dir DIR          (holds ubuntu-*-netboot-amd64.tar.gz, unpacked into the TFTP root by install; default /boot/netboot)
+  --livesystem-dir DIR       (holds clonezilla-live-*-amd64.zip, unpacked by install; default /boot/livesystem)
   --host mac,ip[,hostname]   (repeatable)
   --dry-run                  print every action and generated file, change nothing
 ";
@@ -60,11 +64,13 @@ TARGET_DISK=nvme0n1
 ROOT_MODE=tmpfs
 LIVE_ROOT=/srv/nfs/clonezilla
 
-# Nothing is downloaded: `install` ends by listing the files YOU copy by hand and where they go
-#   Ubuntu netboot tarball : its amd64/ folder (bootx64.efi, grubx64.efi, grub/ ...) -> the TFTP root
-#   Clonezilla Live zip    : live/vmlinuz + live/initrd.img -> <tftp-root>/clonezilla/,
-#                            live/filesystem.squashfs -> <web-root>/clonezilla/ (tmpfs way),
-#                            the whole zip -> LIVE_ROOT (nfs way)
+# Nothing is downloaded. Put the two files into these folders; the last step of `install` unpacks them:
+#   NETBOOT_DIR     ubuntu-*-netboot-amd64.tar.gz : its amd64/ folder (bootx64.efi, grubx64.efi, grub/ ...) -> the TFTP root
+#   LIVESYSTEM_DIR  clonezilla-live-*-amd64.zip   : live/vmlinuz + live/initrd.img -> <tftp-root>/clonezilla/,
+#                   live/filesystem.squashfs -> <web-root>/clonezilla/ (tmpfs way), the whole zip -> LIVE_ROOT (nfs way)
+# then it writes grub.cfg (= sudo pxe-ctl grub). Repeat later with: sudo pxe-ctl import
+NETBOOT_DIR=/boot/netboot
+LIVESYSTEM_DIR=/boot/livesystem
 
 # 1 = the restore entry is the default: a PXE-booted host is ERASED and restored without any question
 # 0 = the PXE menu starts interactive Clonezilla; pick the restore entry by hand (safer for first tests)

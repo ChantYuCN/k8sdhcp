@@ -1,0 +1,2 @@
+pxe-installer-rs/boot/livesystem/clonezilla-live-3.3.3-37-amd64[[:space:]](1).zip filter=lfs diff=lfs merge=lfs -text
+pxe-installer-rs/boot/netboot/ubuntu-26.04.1-netboot-amd64.tar.gz filter=lfs diff=lfs merge=lfs -text

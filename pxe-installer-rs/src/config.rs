@@ -63,6 +63,10 @@ pub struct Config {
     pub root_mode: RootMode,
     /// NFS mode: the extracted Clonezilla Live zip (it contains live/filesystem.squashfs), exported read-only
     pub live_root: String,
+    /// Folder holding the Ubuntu netboot tarball (ubuntu-*-netboot-amd64.tar.gz); `install` unpacks it into the TFTP root
+    pub netboot_dir: String,
+    /// Folder holding the Clonezilla Live zip (clonezilla-live-*-amd64.zip); `install` unpacks what the deploy way needs
+    pub livesystem_dir: String,
     pub tftp_root: String,
     pub web_root: String,
     pub hosts_file: String,
@@ -89,6 +93,8 @@ impl Default for Config {
             target_disk: "nvme0n1".into(),
             root_mode: RootMode::Tmpfs,
             live_root: "/srv/nfs/clonezilla".into(),
+            netboot_dir: "/boot/netboot".into(),
+            livesystem_dir: "/boot/livesystem".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
             hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
@@ -190,6 +196,8 @@ impl Config {
             "TARGET_DISK" => self.target_disk = v.trim_start_matches("/dev/").into(),
             "ROOT_MODE" => self.root_mode = RootMode::parse(v)?,
             "LIVE_ROOT" => self.live_root = v.trim_end_matches('/').into(),
+            "NETBOOT_DIR" => self.netboot_dir = v.trim_end_matches('/').into(),
+            "LIVESYSTEM_DIR" => self.livesystem_dir = v.trim_end_matches('/').into(),
             // the installer no longer downloads anything (the admin copies the files): accepted and ignored
             "DOWNLOAD" | "NETBOOT_URL" | "CLONEZILLA_URL" | "DOWNLOAD_DIR" => {}
             // settings of older (autoinstall / ISO based) versions: accepted and ignored
@@ -383,6 +391,8 @@ impl Config {
             format!("TARGET_DISK={}", self.target_disk),
             format!("ROOT_MODE={}", self.root_mode.as_str()),
             format!("LIVE_ROOT={}", self.live_root),
+            format!("NETBOOT_DIR={}", self.netboot_dir),
+            format!("LIVESYSTEM_DIR={}", self.livesystem_dir),
         ];
         for h in &self.bindings {
             lines.push(format!("HOST={},{},{}", h.mac, h.ip, h.hostname));
@@ -395,13 +405,15 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\nROOT_MODE={}\nLIVE_ROOT={}\n",
+            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\nROOT_MODE={}\nLIVE_ROOT={}\nNETBOOT_DIR={}\nLIVESYSTEM_DIR={}\n",
             self.tftp_root, self.web_root, self.image_dir, self.image_name, self.target_disk, self.hosts_file,
             self.server_ip, self.prefix,
             u8::from(self.auto_install),
             self.target_hostname,
             self.root_mode.as_str(),
-            self.live_root
+            self.live_root,
+            self.netboot_dir,
+            self.livesystem_dir
         )
     }
 
@@ -477,6 +489,22 @@ mod tests {
         // live_root ends up on the kernel command line
         c.live_root = "/srv/my clonezilla".into();
         assert!(c.validate().iter().any(|e| e.contains("LIVE_ROOT")));
+    }
+
+    #[test]
+    fn import_folders_default_set_and_roundtrip() {
+        let mut c = good();
+        assert_eq!((c.netboot_dir.as_str(), c.livesystem_dir.as_str()), ("/boot/netboot", "/boot/livesystem"));
+        c.set("NETBOOT_DIR", "/data/nb/").unwrap();
+        c.set("LIVESYSTEM_DIR", "/data/live").unwrap();
+        let path = std::env::temp_dir().join(format!("pxe-import-{}.conf", std::process::id()));
+        for text in [c.to_conf(), c.runtime_conf()] {
+            std::fs::write(&path, text).unwrap();
+            let mut d = Config::default();
+            d.load_file(path.to_str().unwrap()).unwrap();
+            assert_eq!((d.netboot_dir.as_str(), d.livesystem_dir.as_str()), ("/data/nb", "/data/live"));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub struct Ctx {
@@ -32,15 +34,62 @@ pub fn run(ctx: Ctx, prog: &str, args: &[&str]) -> Result<(), String> {
         println!("[dry-run] $ {}", describe(prog, args));
         return Ok(());
     }
-    let status = Command::new(prog)
-        .args(args)
-        .env("DEBIAN_FRONTEND", "noninteractive")
+    let status = unattended(Command::new(prog).args(args))
         .status()
         .map_err(|e| format!("cannot run '{}': {e}", describe(prog, args)))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!("'{}' failed ({status})", describe(prog, args)))
+    }
+}
+
+/// Make a command unable to wait for a human: stdin is /dev/null (a prompt gets EOF instead of blocking)
+/// and the package tools are told to never ask (debconf, conffile, needrestart, apt-listchanges).
+fn unattended(cmd: &mut Command) -> &mut Command {
+    cmd.stdin(Stdio::null())
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("DEBIAN_PRIORITY", "critical")
+        .env("NEEDRESTART_MODE", "a")
+        .env("NEEDRESTART_SUSPEND", "1")
+        .env("APT_LISTCHANGES_FRONTEND", "none")
+        .env("UCF_FORCE_CONFFOLD", "1")
+}
+
+/// Run a command on the user's own terminal: stdin/stdout/stderr are inherited, so the user sees everything
+/// it prints and can answer its prompts. No timeout (a person is in the loop). Returns the exit code
+/// (-1 when it was killed by a signal).
+pub fn run_tty(prog: &str, args: &[&str]) -> Result<i32, String> {
+    Command::new(prog)
+        .args(args)
+        .status()
+        .map(|s| s.code().unwrap_or(-1))
+        .map_err(|e| format!("cannot run '{}': {e}", describe(prog, args)))
+}
+
+/// Like `run`, but the command is killed (and an error returned) if it is still running after `timeout`,
+/// so a wedged apt/dpkg can never hang the installer forever.
+pub fn run_timeout(ctx: Ctx, prog: &str, args: &[&str], timeout: Duration) -> Result<(), String> {
+    if ctx.dry {
+        println!("[dry-run] $ {}", describe(prog, args));
+        return Ok(());
+    }
+    let mut child = unattended(Command::new(prog).args(args))
+        .spawn()
+        .map_err(|e| format!("cannot run '{}': {e}", describe(prog, args)))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("'{}' failed ({status})", describe(prog, args))),
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("'{}' timed out after {}s and was stopped", describe(prog, args), timeout.as_secs()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Err(e) => return Err(format!("wait for '{prog}': {e}")),
+        }
     }
 }
 
@@ -143,13 +192,25 @@ pub fn fill(template: &str, vars: &[(&str, &str)]) -> String {
     s
 }
 
+/// Seconds since the unix epoch (for measuring elapsed times).
+pub fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Current time as ISO-8601 (via date(1)); falls back to unix seconds.
 pub fn now_iso() -> String {
-    output("date", &["-Is"]).unwrap_or_else(|_| {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        format!("unix:{secs}")
-    })
+    output("date", &["-Is"]).unwrap_or_else(|_| format!("unix:{}", now_epoch()))
+}
+
+/// Seconds as "1h 02m 05s" / "12m 05s" / "45s".
+pub fn fmt_elapsed(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    match (h, m) {
+        (0, 0) => format!("{s}s"),
+        (0, _) => format!("{m}m {s:02}s"),
+        _ => format!("{h}h {m:02}m {s:02}s"),
+    }
 }

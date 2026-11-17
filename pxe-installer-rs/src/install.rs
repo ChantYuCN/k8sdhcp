@@ -1,10 +1,11 @@
-//! The `install` command installs dnsmasq + Apache + NFS + the Clonezilla tools and creates the directories,
-//! then tells the admin which files to copy where; the `start` command writes the PXE configuration and
-//! starts the services. Targets boot Clonezilla Live over PXE and restore a Clonezilla image (served over
-//! NFS) onto their disk.
-//! It does NOT download or copy the Ubuntu netboot files, Clonezilla Live or the image - the admin does.
+//! The `install` command installs dnsmasq + Apache + NFS + the Clonezilla tools, creates the directories and
+//! unpacks the Ubuntu netboot tarball (NETBOOT_DIR) and the Clonezilla Live zip (LIVESYSTEM_DIR) into place;
+//! the `start` command writes the PXE configuration and starts the services. Targets boot Clonezilla Live over
+//! PXE and restore a Clonezilla image (served over NFS) onto their disk.
+//! It does NOT download anything, and the Clonezilla image itself is the admin's (`pxe-ctl clone` or a copy).
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::{Config, RootMode};
 use crate::ctl;
@@ -80,7 +81,8 @@ fn manual_steps(c: &Config) -> String {
     let live_root = &c.live_root;
     let (img, dir) = (&c.image_name, &c.image_dir);
     format!(
-        "COPY THESE FILES BY HAND (this installer does not download or copy them):\n\
+        "FILES THE INSTALLER COULD NOT IMPORT (it unpacks them from the folders NETBOOT_DIR / LIVESYSTEM_DIR,\n\
+         \x20 `sudo pxe-ctl import` repeats that; if a note above says a file is missing, copy it by hand):\n\
          \x20 1. Ubuntu netboot tarball (e.g. ubuntu-26.04.1-netboot-amd64.tar.gz from releases.ubuntu.com):\n\
          \x20      tar -xzf ubuntu-*-netboot-amd64.tar.gz\n\
          \x20      sudo cp -r amd64/* {tftp}/\n\
@@ -99,16 +101,119 @@ fn manual_steps(c: &Config) -> String {
     )
 }
 
-/// `install`: packages and directories only. Nothing is downloaded or configured and the services are
-/// left stopped; it ends by telling the admin which files to copy where, and `start` does the configuration.
+/// First file in `dir` named `<prefix>*<suffix>` (the highest name = the newest version), if there is one.
+fn find_archive(dir: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(prefix) && n.ends_with(suffix))
+        .collect();
+    names.sort();
+    names.pop().map(|n| format!("{dir}/{n}"))
+}
+
+/// Scratch folder that is removed again when it goes out of scope.
+struct TempDir {
+    path: String,
+    dry: bool,
+}
+impl TempDir {
+    fn new(ctx: Ctx, path: String) -> Result<Self, String> {
+        mkdir(ctx, &path)?;
+        Ok(TempDir { path, dry: ctx.dry })
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if !self.dry {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// `sudo tar -xzf ubuntu-*-netboot-amd64.tar.gz` + `sudo cp -r amd64/* <tftp root>/`, with the tarball taken
+/// from NETBOOT_DIR and unpacked in a scratch folder. Returns false (with a note) when there is no tarball.
+fn import_netboot(c: &Config, ctx: Ctx) -> Result<bool, String> {
+    let Some(tar) = find_archive(&c.netboot_dir, "ubuntu-", "-netboot-amd64.tar.gz") else {
+        println!("note: no ubuntu-*-netboot-amd64.tar.gz in {} (NETBOOT_DIR): copy the netboot files by hand", c.netboot_dir);
+        return Ok(false);
+    };
+    println!("netboot tarball: {tar}");
+    let tmp = TempDir::new(ctx, format!("/var/tmp/pxe-installer-netboot-{}", std::process::id()))?;
+    run(ctx, "tar", &["-xzf", &tar, "-C", &tmp.path])?;
+    let src = format!("{}/amd64", tmp.path);
+    if !ctx.dry && !Path::new(&src).is_dir() {
+        return Err(format!("{tar} has no amd64/ folder: is it the Ubuntu amd64 netboot tarball?"));
+    }
+    mkdir(ctx, &c.tftp_root)?;
+    run(ctx, "cp", &["-r", &format!("{src}/."), &c.tftp_root])?;
+    Ok(true)
+}
+
+/// `unzip clonezilla-live-*-amd64.zip` + copy of what the deploy way needs, with the zip taken from
+/// LIVESYSTEM_DIR: vmlinuz + initrd.img -> <tftp root>/clonezilla/ always; then, depending on ROOT_MODE, only
+/// live/filesystem.squashfs -> <web root>/clonezilla/ (tmpfs) or the whole zip -> LIVE_ROOT (nfs).
+/// Members are extracted straight to their destination (no scratch copy of the ~0.5 GB squashfs).
+/// Returns false (with a note) when there is no zip.
+fn import_live(c: &Config, ctx: Ctx) -> Result<bool, String> {
+    let Some(zip) = find_archive(&c.livesystem_dir, "clonezilla-live-", "-amd64.zip") else {
+        println!("note: no clonezilla-live-*-amd64.zip in {} (LIVESYSTEM_DIR): copy Clonezilla Live by hand", c.livesystem_dir);
+        return Ok(false);
+    };
+    println!("Clonezilla Live zip: {zip}");
+    let tftp = cz_tftp_dir(c);
+    mkdir(ctx, &tftp)?;
+    // -o: overwrite without asking, -q: quiet, -j: no folder names (live/vmlinuz -> <tftp>/vmlinuz)
+    run(ctx, "unzip", &["-oqj", &zip, "live/vmlinuz", "live/initrd.img", "-d", &tftp])?;
+    match c.root_mode {
+        RootMode::Tmpfs => {
+            let web = cz_web_dir(c);
+            mkdir(ctx, &web)?;
+            run(ctx, "unzip", &["-oqj", &zip, "live/filesystem.squashfs", "-d", &web])?;
+        }
+        RootMode::Nfs => {
+            mkdir(ctx, &c.live_root)?;
+            run(ctx, "unzip", &["-oq", &zip, "-d", &c.live_root])?;
+        }
+    }
+    Ok(true)
+}
+
+/// Used by `start` and `pxe-ctl mode`: the live filesystem of the chosen deploy way is not there yet (the way
+/// was chosen or switched after `install`) -> unpack it from the Clonezilla Live zip, if that is available.
+pub fn import_live_if_missing(c: &Config, ctx: Ctx) -> Result<(), String> {
+    if ctx.dry || Path::new(&squashfs_path(c)).exists() {
+        return Ok(());
+    }
+    step("Unpacking Clonezilla Live for the chosen deploy way");
+    if import_live(c, ctx)? {
+        ctl::fix_perms(c, ctx)?;
+    }
+    Ok(())
+}
+
+/// Both imports, then what `sudo pxe-ctl grub` does: the netboot tarball ships its own grub.cfg that has just
+/// replaced ours, so ours is written again, and the owner/mode of everything under the TFTP root is fixed.
+/// Used by `install` (end of the process) and `pxe-ctl import`. Missing archives are notes, not errors.
+pub fn import_boot_files(c: &Config, ctx: Ctx) -> Result<(), String> {
+    let netboot = import_netboot(c, ctx)?;
+    let live = import_live(c, ctx)?;
+    if netboot || live {
+        step("Writing grub.cfg and fixing permissions");
+        ctl::write_grub(c, ctx)?;
+    }
+    Ok(())
+}
+
+/// `install`: packages and directories, then the netboot / Clonezilla Live files are unpacked from
+/// NETBOOT_DIR / LIVESYSTEM_DIR into place. Nothing is downloaded; the services are left stopped and `start`
+/// does the configuration. What is still missing is listed at the end.
 pub fn install(c: &Config) -> Result<(), String> {
     let ctx = prepare(c, false)?;
 
     step("Installing packages");
-    run(ctx, "apt-get", &["update", "-y"])?;
-    let mut apt = vec!["install", "-y"];
-    apt.extend(PACKAGES);
-    run(ctx, "apt-get", &apt)?;
+    install_packages(ctx)?;
 
     step("Creating directories");
     for dir in [c.tftp_root.clone(), cz_tftp_dir(c), cz_web_dir(c), c.image_dir.clone(), c.live_root.clone()] {
@@ -127,6 +232,10 @@ pub fn install(c: &Config) -> Result<(), String> {
     step("Stopping services");
     run(ctx, "systemctl", &["stop", "dnsmasq", "apache2", "nfs-server"])?;
 
+    // last: everything it needs is installed and the services are stopped
+    step("Importing the netboot files and Clonezilla Live");
+    import_boot_files(c, ctx)?;
+
     if !ctx.dry {
         report_missing(c);
     }
@@ -138,8 +247,122 @@ pub fn install(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// apt-get options that keep it from ever waiting for a person or for the network forever:
+/// - -y/-q and the two --force-conf* options answer every dpkg/conffile question;
+/// - DPkg::Lock::Timeout waits (bounded) for unattended-upgrades or another apt instead of failing at once;
+/// - Acquire::* bound a dead mirror (retry 3 times, 30 s per connection).
+const APT_OPTS: [&str; 14] = [
+    "-y",
+    "-q",
+    "-o",
+    "DPkg::Lock::Timeout=600",
+    "-o",
+    "Acquire::Retries=3",
+    "-o",
+    "Acquire::http::Timeout=30",
+    "-o",
+    "Acquire::https::Timeout=30",
+    "-o",
+    "Dpkg::Options::=--force-confdef",
+    "-o",
+    "Dpkg::Options::=--force-confold",
+];
+const DPKG_FIX: [&str; 4] = ["--configure", "-a", "--force-confdef", "--force-confold"];
+const APT_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
+const APT_INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
+const POLICY_RC_D: &str = "/usr/sbin/policy-rc.d";
+
+/// While alive, packages being installed do not start their services (policy-rc.d answers 101 = "denied").
+/// dnsmasq cannot start while systemd-resolved holds port 53, and a failing service start in a postinst
+/// script would leave the package half-configured. `start` starts everything once configured.
+/// An already existing policy-rc.d (e.g. in a container) is left alone.
+struct NoAutoStart(bool);
+impl NoAutoStart {
+    fn new(ctx: Ctx) -> Self {
+        if ctx.dry || Path::new(POLICY_RC_D).exists() {
+            return Self(false);
+        }
+        Self(write_file(ctx, POLICY_RC_D, "#!/bin/sh\nexit 101\n", 0o755, false).is_ok())
+    }
+}
+impl Drop for NoAutoStart {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = fs::remove_file(POLICY_RC_D);
+        }
+    }
+}
+
+fn apt_get(ctx: Ctx, timeout: Duration, tail: &[&str]) -> Result<(), String> {
+    let mut args: Vec<&str> = APT_OPTS.to_vec();
+    args.extend(tail);
+    run_timeout(ctx, "apt-get", &args, timeout)
+}
+
+/// Install whatever of PACKAGES is missing, fully unattended: no prompt can block it, waiting for the apt
+/// lock and for the network is bounded, and an interrupted earlier dpkg run is repaired first.
+fn install_packages(ctx: Ctx) -> Result<(), String> {
+    let missing = missing_packages();
+    if missing.is_empty() {
+        println!("all packages already installed: {}; skipping apt", PACKAGES.join(", "));
+        return Ok(());
+    }
+    println!("installing: {} (waits up to 10 min if another apt/dpkg, e.g. unattended-upgrades, is running)", missing.join(" "));
+    let _no_autostart = NoAutoStart::new(ctx);
+
+    // finish a previous, interrupted dpkg run, otherwise every install fails on it
+    if let Err(e) = run_timeout(ctx, "dpkg", &DPKG_FIX, APT_INSTALL_TIMEOUT) {
+        warn(&e);
+    }
+
+    // a failing `update` (one unreachable repo) is not fatal: the install below may still work from the cache
+    let mut updated = false;
+    for attempt in 1..=3 {
+        match apt_get(ctx, APT_UPDATE_TIMEOUT, &["update"]) {
+            Ok(()) => {
+                updated = true;
+                break;
+            }
+            Err(e) => {
+                warn(&format!("apt-get update, attempt {attempt}/3: {e}"));
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+    if !updated {
+        warn("apt-get update did not succeed; trying to install from the existing package lists");
+    }
+
+    let mut tail = vec!["install"];
+    tail.extend(missing.iter().copied());
+    if let Err(first) = apt_get(ctx, APT_INSTALL_TIMEOUT, &tail) {
+        warn(&format!("{first}; repairing and retrying once"));
+        run_soft_timeout(ctx, "dpkg", &DPKG_FIX);
+        let _ = apt_get(ctx, APT_INSTALL_TIMEOUT, &["-f", "install"]);
+        apt_get(ctx, APT_INSTALL_TIMEOUT, &tail)?;
+    }
+    Ok(())
+}
+
+fn run_soft_timeout(ctx: Ctx, prog: &str, args: &[&str]) {
+    if let Err(e) = run_timeout(ctx, prog, args, APT_INSTALL_TIMEOUT) {
+        warn(&e);
+    }
+}
+
+/// `dpkg -s` also succeeds for removed-but-configured packages, so ask for the exact state.
+fn pkg_installed(p: &str) -> bool {
+    output("dpkg-query", &["-W", "-f=${Status}", p]).is_ok_and(|s| s == "install ok installed")
+}
+
+fn missing_packages() -> Vec<&'static str> {
+    PACKAGES.iter().copied().filter(|p| !pkg_installed(p)).collect()
+}
+
 fn check_packages() -> Result<(), String> {
-    let missing: Vec<&str> = PACKAGES.iter().copied().filter(|p| !probe("dpkg", &["-s", p])).collect();
+    let missing = missing_packages();
     if missing.is_empty() {
         println!("packages installed: {}", PACKAGES.join(", "));
         Ok(())
@@ -159,6 +382,11 @@ pub fn start(c: &Config) -> Result<(), String> {
     step("Checking dnsmasq and Apache are installed");
     if !ctx.dry {
         check_packages()?;
+    }
+
+    // a failure here only means the live system has to be copied by hand (report_missing says so at the end)
+    if let Err(e) = import_live_if_missing(c, ctx) {
+        warn(&e);
     }
 
     steps(c, ctx)?;
@@ -429,5 +657,32 @@ fn set_mode_soft(ctx: Ctx, path: &str, mode: u32) {
         println!("[dry-run] chmod {mode:o} {path}");
     } else if let Err(e) = set_mode(path, mode) {
         warn(&e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_matching_archive_is_found() {
+        let dir = std::env::temp_dir().join(format!("pxe-archives-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for n in [
+            "ubuntu-24.04.4-netboot-amd64.tar.gz",
+            "ubuntu-26.04.1-netboot-amd64.tar.gz",
+            "ubuntu-26.04.1-live-server-amd64.iso", // not a netboot tarball
+            "notes.txt",
+        ] {
+            fs::write(dir.join(n), "").unwrap();
+        }
+        let d = dir.to_string_lossy().to_string();
+        assert_eq!(
+            find_archive(&d, "ubuntu-", "-netboot-amd64.tar.gz"),
+            Some(format!("{d}/ubuntu-26.04.1-netboot-amd64.tar.gz"))
+        );
+        assert_eq!(find_archive(&d, "clonezilla-live-", "-amd64.zip"), None);
+        assert_eq!(find_archive("/no/such/dir", "ubuntu-", ".gz"), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

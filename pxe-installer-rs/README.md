@@ -30,11 +30,24 @@ sudo apt install libgtk-4-dev build-essential pkg-config curl  # GUI only
 Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) and
 `target/release/pxe-installer-gui` (GUI; keep it in the same folder as `pxe-installer`).
 
-## What `install` does, and the files you copy by hand
+## What `install` does, and the files it unpacks
 `install` installs the packages (dnsmasq, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
 `clonezilla partclone pigz zstd`), creates the directories and leaves the services stopped. **It downloads
-nothing.** At the end (in the terminal and in the GUI log) it lists the files you copy by hand and where they
-go, using your configured paths. The default ones:
+nothing.** As its **last step** it unpacks the two files you put on the server beforehand:
+
+| Put it in (setting) | `install` then does |
+| --- | --- |
+| `/boot/netboot/ubuntu-*-netboot-amd64.tar.gz` (`NETBOOT_DIR`) | `tar -xzf` into a scratch folder, `cp -r amd64/.` into the TFTP root |
+| `/boot/livesystem/clonezilla-live-*-amd64.zip` (`LIVESYSTEM_DIR`) | `unzip` of `live/vmlinuz` + `live/initrd.img` into `<tftp-root>/clonezilla/`, and for the deploy way (`ROOT_MODE`): `live/filesystem.squashfs` into `<web-root>/clonezilla/` (tmpfs) or the whole zip into `LIVE_ROOT` (nfs) |
+
+then it writes `grub.cfg` and fixes the permissions (what `sudo pxe-ctl grub` does; the netboot tarball ships
+its own `grub.cfg`). If several files match, the highest version is used. A missing file is a note, not an
+error. `start` unpacks the live system again if the deploy way chosen there needs files that are not there
+yet, and `sudo pxe-ctl import` repeats the whole step (for example after putting a newer zip into the
+folder). `pxe-ctl mode` does the same for the new deploy way.
+
+If a file is not in those folders, copy it by hand to where it goes (the log lists the missing ones, using
+your configured paths). The default targets:
 
 | File you obtain | Copy it to |
 | --- | --- |
@@ -67,18 +80,28 @@ sudo ocs-sr -q2 -c -j2 -z9p -sfsck -senc -p true savedisk cri-golden nvme0n2   #
 sudo pxe-ctl nfs                            # (re-)export /home/partimag read-only over NFS
 ```
 `pxe-ctl clone <disk> [--yes] [--force]` (also the **Clone Image** button and its disk field on the GUI's
-Manage tab) runs exactly that `ocs-sr` command and then re-exports `IMAGE_DIR` over NFS. Before it starts it
-refuses a disk that is not a whole disk, is mounted or holds swap (an OS disk that is running must be imaged
-from Clonezilla Live instead), and an `IMAGE_NAME` that already exists (delete it, or use `--force` / the
-"Overwrite" checkbox, which removes the old image first). The disk itself is only read. `--yes` runs without
-the confirmation prompt (`-batch` instead of `-c`; the GUI always uses it). Only one clone runs at a time, and
-`IMAGE_DIR` has to be `/home/partimag`, where `ocs-sr` saves images.
+Manage tab, which opens a terminal window for it) works **interactively on the terminal**, in two stages, and
+then re-exports `IMAGE_DIR` over NFS:
+1. `fsck -f` on every filesystem of the disk, one after the other. fsck asks its own questions, so a problem
+   can be fixed right there; if one remains you choose: run fsck again, open a shell to fix it by hand,
+   continue anyway, or abort. (A damaged filesystem would otherwise end up in the golden image.)
+2. exactly the `ocs-sr` command above (with `-c`), with its own prompts on the same terminal.
+
+Before it starts it refuses a disk that is not a whole disk, is mounted or holds swap (an OS disk that is
+running must be imaged from Clonezilla Live instead). If `IMAGE_NAME` already exists it asks whether to replace
+it (`--force` / the "Overwrite" checkbox answers yes); the old image is only deleted after fsck succeeded. The
+disk itself is only read. `--yes` runs without any prompt (read-only `fsck -f -n` that aborts on the first
+problem, `ocs-sr -batch`) for scripts. Only one clone runs at a time, and `IMAGE_DIR` has to be
+`/home/partimag`, where `ocs-sr` saves images.
 **The target disk is erased.** Which image and disk are used: `IMAGE_NAME` (default `cri-golden`) and
 `TARGET_DISK` (default `nvme0n1`) in the config. By default (`AUTO_INSTALL=1`) the restore entry is the
 default PXE menu entry: a PXE-booted host is erased and restored without any question (use
 `ONLY_KNOWN_HOSTS=1` so only bound hosts are served). Set `AUTO_INSTALL=0` and re-run `start` for a menu
 that starts an interactive Clonezilla Live, where the restore entry has to be selected by hand (safer for
 first tests).
+The restore entry is fully unattended from the PXE menu to the final reboot: GRUB picks it after the 5 s
+timeout, Clonezilla Live skips the keyboard/language questions (`ocs_live_keymap=NONE`, `ocs_lang`), runs
+`ocs-sr ... -batch ... restoredisk` (no confirmation, no "press Enter"), then `post.sh` and `reboot`.
 
 ## Deploy way: tmpfs or NFS root
 How a target gets the Clonezilla Live system itself (the image is always read over NFS):
@@ -105,8 +128,8 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ./target/release/pxe-installer-gui
 ```
 Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
-**Install** (packages, directories, services stopped) -> **copy the netboot files and Clonezilla Live by
-hand** to the folders the log lists -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
+**Install** (packages, directories, then the netboot tarball in `/boot/netboot` and the Clonezilla Live zip
+in `/boot/livesystem` are unpacked; services stopped) -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
 and streams the output with a progress bar; the temp file is deleted afterwards. Manage tab: host status,
 installed hosts, bindings, re-export images, switch the deploy way, reinstall / mark installed / bind / unbind.
@@ -114,11 +137,12 @@ installed hosts, bindings, re-export images, switch the deploy way, reinstall / 
 ## CLI
 ```
 pxe-installer print-config > pxe.conf       # edit it (IMAGE_NAME, TARGET_DISK, network)
-sudo ./pxe-installer install --config pxe.conf                  # packages + directories; lists the files to copy by hand
+sudo ./pxe-installer install --config pxe.conf                  # packages + directories + unpacks NETBOOT_DIR / LIVESYSTEM_DIR
 sudo ./pxe-installer start   --config pxe.conf --dry-run        # show everything it would do/write
 sudo ./pxe-installer start   --config pxe.conf
 
-sudo pxe-ctl status                          # per-host: installed / pending / waiting
+sudo pxe-ctl status                          # per-host: installed / pending / waiting + last deploy time
+sudo pxe-ctl times                           # deploy time of every MAC (all runs, plus deploys still running)
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
 sudo pxe-ctl grub | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | stop
@@ -145,6 +169,18 @@ The post-restore script's last step calls `http://SERVER/cgi-bin/pxe-done?mac=..
 `pxe-installer cgi-done` and creates `/var/lib/tftpboot/done/<mac>`. `grub.cfg` exits to the local disk
 when that file exists. A failed restore (or a failed `post.sh`) leaves no marker and retries on the next
 PXE boot. Use `ONLY_KNOWN_HOSTS=1` so only hosts you bound get a DHCP answer at all.
+
+## Deploy time per MAC
+The restore menu entry calls `http://SERVER/cgi-bin/pxe-seed/<mac>/start` (kernel argument `ocs_prerun1`) as
+soon as Clonezilla Live is up, and `pxe-done` is called at the very end. The server records the difference:
+`pxe-ctl times` (Manage tab: **Deploy times**) lists every finished deploy as MAC, start, finish and elapsed
+time, plus deploys that started but have not finished; `pxe-ctl status` shows the latest one per host. The
+history is appended to `/var/lib/tftpboot/done/deploy-times.csv` (`mac,started,finished,elapsed_seconds`) and
+survives `pxe-ctl reinstall`. The elapsed time covers the restore, `post.sh` and the callback; it does **not**
+include the firmware / DHCP / TFTP phase or, in the `tmpfs` deploy way, the download of
+`filesystem.squashfs`, all of which happen before Clonezilla can call the server. A restarted deploy restarts
+the clock; a deploy without a recorded start (for example after an upgrade, with an old `grub.cfg`) is logged
+with empty start and elapsed. Re-run `start` (or `pxe-ctl grub`) once so the new `grub.cfg` is written.
 
 ## What `start` does
 (optional netplan static IP) -> free port 53 -> `/etc/dnsmasq.d/pxe.conf` (global `/etc/dnsmasq.conf` is

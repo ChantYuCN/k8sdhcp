@@ -1,10 +1,11 @@
 //! Day-2 commands: installed-host markers, MAC->IP bindings, status, and the Apache CGI callback.
 use std::fs;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use crate::config::{is_disk_name, is_hostname, is_image_name, is_mac, normalize_mac, Config, RootMode};
 use crate::render;
-use crate::util::{mkdir, now_iso, output, probe, run, run_soft, write_file, Ctx};
+use crate::util::{fmt_elapsed, mkdir, now_epoch, now_iso, output, probe, run, run_soft, run_tty, step, warn, write_file, Ctx};
 
 const LEASES: &str = "/var/lib/misc/dnsmasq.leases";
 
@@ -44,6 +45,93 @@ pub fn mark_done(c: &Config, mac: &str) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
     let path = format!("{dir}/{mac}");
     fs::write(&path, format!("{}\n", now_iso())).map_err(|e| format!("write {path}: {e}"))
+}
+
+/// Deploy times. The restore entry calls `pxe-seed/<mac>/start` when Clonezilla comes up (-> a file in
+/// `done/start/<mac>`: epoch seconds + ISO time) and post.sh calls `pxe-done` at the end; that call appends
+/// one line per finished deploy to `done/deploy-times.csv` (history, survives `reinstall`):
+/// `mac,started,finished,elapsed_seconds`. Neither name is a MAC, so the marker logic ignores them.
+const DEPLOY_LOG: &str = "deploy-times.csv";
+
+fn start_dir(c: &Config) -> String {
+    format!("{}/start", c.done_dir())
+}
+
+/// A deploy of `mac` starts now (a restarted deploy simply overwrites the earlier start).
+pub fn mark_start(c: &Config, mac: &str) -> Result<(), String> {
+    let dir = start_dir(c);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+    let path = format!("{dir}/{mac}");
+    fs::write(&path, format!("{}\n{}\n", now_epoch(), now_iso())).map_err(|e| format!("write {path}: {e}"))
+}
+
+/// (epoch, ISO time) of a recorded start.
+fn read_start(c: &Config, mac: &str) -> Option<(u64, String)> {
+    let text = fs::read_to_string(format!("{}/{mac}", start_dir(c))).ok()?;
+    let mut lines = text.lines();
+    let epoch = lines.next()?.trim().parse().ok()?;
+    Some((epoch, lines.next().unwrap_or("").trim().to_string()))
+}
+
+/// The deploy of `mac` finished now: append start/finish/elapsed to the history and drop the start file.
+/// Without a recorded start (the call failed, or an older install) the line has empty start and elapsed.
+pub fn record_deploy(c: &Config, mac: &str) -> Result<(), String> {
+    let (started, secs) = match read_start(c, mac) {
+        Some((epoch, iso)) => (iso, now_epoch().saturating_sub(epoch).to_string()),
+        None => (String::new(), String::new()),
+    };
+    fs::create_dir_all(c.done_dir()).map_err(|e| format!("mkdir {}: {e}", c.done_dir()))?;
+    let path = format!("{}/{DEPLOY_LOG}", c.done_dir());
+    let mut line = String::new();
+    if !Path::new(&path).exists() {
+        line.push_str("mac,started,finished,elapsed_seconds\n");
+    }
+    line.push_str(&format!("{mac},{started},{},{secs}\n", now_iso()));
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("open {path}: {e}"))?;
+    f.write_all(line.as_bytes()).map_err(|e| format!("write {path}: {e}"))?;
+    let _ = fs::remove_file(format!("{}/{mac}", start_dir(c)));
+    Ok(())
+}
+
+/// Finished deploys, oldest first: (mac, started, finished, elapsed seconds if known).
+fn deploy_history(c: &Config) -> Vec<(String, String, String, Option<u64>)> {
+    let text = fs::read_to_string(format!("{}/{DEPLOY_LOG}", c.done_dir())).unwrap_or_default();
+    text.lines()
+        .skip(1) // header
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(',').collect();
+            (f.len() == 4 && is_mac(f[0])).then(|| (f[0].to_string(), f[1].to_string(), f[2].to_string(), f[3].parse().ok()))
+        })
+        .collect()
+}
+
+/// `pxe-ctl times`: every finished deploy with its elapsed time, then the ones that started but have not
+/// called done yet (still running, or failed before the end).
+fn show_times(c: &Config) {
+    let history = deploy_history(c);
+    let mut running: Vec<(String, u64, String)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(start_dir(c)) {
+        for e in rd.flatten() {
+            let mac = e.file_name().to_string_lossy().to_string();
+            if let (true, Some((epoch, iso))) = (is_mac(&mac), read_start(c, &mac)) {
+                running.push((mac, epoch, iso));
+            }
+        }
+    }
+    running.sort();
+    if history.is_empty() && running.is_empty() {
+        println!("no deploy recorded yet (a deploy is recorded from the Clonezilla start to the done callback)");
+        return;
+    }
+    println!("{:<18} {:<26} {:<26} {}", "MAC", "STARTED", "FINISHED", "ELAPSED");
+    for (mac, start, end, secs) in &history {
+        let elapsed = secs.map(fmt_elapsed).unwrap_or_else(|| "-".into());
+        println!("{:<18} {:<26} {:<26} {}", mac, start, end, elapsed);
+    }
+    let now = now_epoch();
+    for (mac, epoch, iso) in &running {
+        println!("{:<18} {:<26} {:<26} {} so far", mac, iso, "(not finished)", fmt_elapsed(now.saturating_sub(*epoch)));
+    }
 }
 
 /// Prefix of every binding line in the hosts file (it is loaded with `conf-file=`).
@@ -166,7 +254,8 @@ fn status(c: &Config) {
     macs.sort();
     macs.dedup();
 
-    println!("{:<18} {:<16} {:<16} {:<10} {}", "MAC", "BOUND IP", "LEASE IP", "STATE", "INSTALLED AT");
+    let history = deploy_history(c);
+    println!("{:<18} {:<16} {:<16} {:<10} {:<26} {}", "MAC", "BOUND IP", "LEASE IP", "STATE", "INSTALLED AT", "DEPLOY TIME");
     for mac in &macs {
         let bound = hosts
             .iter()
@@ -182,7 +271,15 @@ fn status(c: &Config) {
         } else {
             "waiting"
         };
-        println!("{:<18} {:<16} {:<16} {:<10} {}", mac, bound, lease, state, done.map(|d| d.1.as_str()).unwrap_or(""));
+        // elapsed time of the latest finished deploy of this MAC
+        let took = history
+            .iter()
+            .rev()
+            .find(|h| &h.0 == mac)
+            .and_then(|h| h.3)
+            .map(fmt_elapsed)
+            .unwrap_or_default();
+        println!("{:<18} {:<16} {:<16} {:<10} {:<26} {}", mac, bound, lease, state, done.map(|d| d.1.as_str()).unwrap_or(""), took);
     }
     println!("\nstate: installed = marker present (PXE skips it) | pending = has a DHCP lease, no done callback yet | waiting = bound, never seen");
 }
@@ -209,6 +306,10 @@ fn switch_mode(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
             RootMode::Nfs => "the target mounts the live system from the server over NFS",
         }
     );
+    // the new way needs other files: unpack them from the Clonezilla Live zip when it is available
+    if let Err(e) = crate::install::import_live_if_missing(&c, ctx) {
+        warn(&e);
+    }
     crate::install::report_missing(&c);
     Ok(())
 }
@@ -245,11 +346,100 @@ impl Drop for CloneLock {
     }
 }
 
+/// Read one answer from the terminal: repeats `msg` until the first letter typed is one of `choices`.
+fn ask(msg: &str, choices: &str) -> Result<char, String> {
+    let stdin = std::io::stdin();
+    loop {
+        print!("{msg}");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).map_err(|e| format!("read answer: {e}"))? == 0 {
+            return Err("no answer (the terminal was closed)".into());
+        }
+        if let Some(ch) = line.trim().chars().next().map(|c| c.to_ascii_lowercase()) {
+            if choices.contains(ch) {
+                return Ok(ch);
+            }
+        }
+    }
+}
+
+/// Filesystems fsck can look at on `dev` (the disk and its partitions): (device path, fs type).
+fn checkable_filesystems(dev: &str) -> Result<Vec<(String, String)>, String> {
+    // not checkable as a filesystem: swap, and containers (LVM / LUKS / RAID members)
+    const SKIP: [&str; 6] = ["swap", "LVM2_member", "crypto_LUKS", "linux_raid_member", "zfs_member", "ddf_raid_member"];
+    let out = output("lsblk", &["-nrpo", "PATH,TYPE,FSTYPE", dev]).map_err(|e| format!("cannot list partitions of {dev}: {e}"))?;
+    let mut found = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // a partition without a filesystem has only two fields
+        if f.len() == 3 && matches!(f[1], "part" | "disk") && !SKIP.contains(&f[2]) {
+            found.push((f[0].to_string(), f[2].to_string()));
+        }
+    }
+    Ok(found)
+}
+
+/// Run `fsck -f` on every filesystem of `dev` BEFORE the capture, so a damaged filesystem does not end up in
+/// the golden image. Interactive: fsck runs on the terminal (its own prompts are answered by the user) and on
+/// a problem the user chooses: run it again, open a shell to fix it by hand, continue anyway, or abort.
+/// Not interactive: read-only `fsck -f -n`; any problem aborts the clone.
+fn check_filesystems(dev: &str, interactive: bool) -> Result<(), String> {
+    let list = checkable_filesystems(dev)?;
+    if list.is_empty() {
+        println!("no checkable filesystem found on {dev}");
+        return Ok(());
+    }
+    step(&format!("Checking {} filesystem(s) of {dev} with fsck", list.len()));
+    for (path, fs_type) in &list {
+        // `fsck.<type>` is looked up by fsck itself; check first so a missing tool is a note, not a "problem"
+        if !probe("sh", &["-c", "command -v \"fsck.$1\" >/dev/null", "sh", fs_type]) {
+            println!("skip {path}: fsck.{fs_type} is not installed");
+            continue;
+        }
+        loop {
+            println!("\n--- fsck -f {path} ({fs_type}) ---");
+            let args: Vec<&str> = if interactive { vec!["-f", path] } else { vec!["-f", "-n", path] };
+            let code = run_tty("fsck", &args)?;
+            // fsck exit code bits: 1 = errors corrected, 2 = corrected + reboot advised; anything else is a problem
+            if code & !3 == 0 {
+                println!("{path}: OK");
+                break;
+            }
+            if !interactive {
+                return Err(format!(
+                    "fsck found a problem on {path} (exit code {code}): run `sudo pxe-ctl clone <disk>` in a terminal to fix it interactively"
+                ));
+            }
+            let msg = format!(
+                "\nfsck reported a problem on {path} (exit code {code}). What now?\n  \
+                 [r] run fsck again   [s] open a shell to fix it by hand   [c] continue anyway   [a] abort\n> "
+            );
+            match ask(&msg, "rsca")? {
+                'r' => {}
+                's' => {
+                    println!("Shell on {path}'s host: fix it, then type `exit` (fsck runs again afterwards).");
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                    let _ = run_tty(&shell, &[]);
+                }
+                'c' => {
+                    warn(&format!("continuing although fsck reported a problem on {path}"));
+                    break;
+                }
+                _ => return Err("aborted by the user: nothing was captured".into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `ctl clone <disk> [--yes] [--force]` - capture <disk> of THIS host into the Clonezilla image repository as
 /// IMAGE_NAME (`ocs-sr savedisk`, partclone + parallel zstd) and re-export the repository over NFS, so the
 /// targets can restore it. The disk is only read, but it must be idle: not mounted, no swap, not in use.
-/// `--yes` runs without the confirmation prompt (the GUI has no terminal for it); `--force` deletes an
-/// existing image of the same name first (without it that is an error).
+/// Default = interactive, on the terminal it is run from: `fsck -f` of every filesystem first (the user
+/// fixes problems right there), then `ocs-sr` with its own prompts. `--yes` runs without any prompt
+/// (read-only fsck that aborts on a problem, `ocs-sr -batch`); `--force` replaces an existing image of the
+/// same name (interactive: it is asked, non-interactive without --force it is an error).
 fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
     let (disk, yes, force) = parse_clone_args(args)?;
     if !is_image_name(&c.image_name) {
@@ -282,6 +472,13 @@ fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // interactive (default): fsck and ocs-sr run on this terminal, the user sees everything and answers the
+    // prompts; --yes: no prompts at all (read-only fsck that aborts on a problem, `ocs-sr -batch`)
+    let interactive = !yes;
+    if interactive && !std::io::stdin().is_terminal() {
+        return Err("an interactive clone needs a terminal: run `sudo pxe-ctl clone <disk>` in one, or pass --yes to run without prompts".into());
+    }
+
     // take the lock BEFORE touching the image: a second click must not delete what the first one is writing
     let _lock = fs::OpenOptions::new()
         .write(true)
@@ -290,24 +487,39 @@ fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
         .map(|_| CloneLock)
         .map_err(|_| format!("another clone is running (or a stale lock: remove {CLONE_LOCK} if none is)"))?;
 
+    // decide about an existing image NOW, not after the (long) fsck; it is only deleted after fsck succeeded
     let image = format!("{}/{}", c.image_dir, c.image_name);
-    if Path::new(&image).exists() {
-        if !force {
+    let replace = Path::new(&image).exists();
+    if replace && !force {
+        if !interactive {
             return Err(format!(
                 "image {image} already exists: delete it first (sudo rm -rf {image}) or use --force / the \"Overwrite\" box"
             ));
         }
+        if ask(&format!("image {image} already exists. Replace it? [y/n] "), "yn")? != 'y' {
+            return Err("aborted: the existing image was kept".into());
+        }
+    }
+
+    check_filesystems(&dev, interactive)?;
+
+    if replace {
         fs::remove_dir_all(&image).map_err(|e| format!("remove old image {image}: {e}"))?;
         println!("removed the old image {image}");
     }
 
-    println!("Capturing {dev} as image {} (this takes a while, depending on the used data)", c.image_name);
-    let confirm = if yes { "-batch" } else { "-c" };
-    run(
-        Ctx { dry: false },
-        "ocs-sr",
-        &["-q2", confirm, "-j2", "-z9p", "-sfsck", "-senc", "-p", "true", "savedisk", &c.image_name, &disk],
-    )?;
+    println!("\nCapturing {dev} as image {} (this takes a while, depending on the used data)", c.image_name);
+    let confirm = if interactive { "-c" } else { "-batch" };
+    let ocs: &[&str] = &["-q2", confirm, "-j2", "-z9p", "-sfsck", "-senc", "-p", "true", "savedisk", &c.image_name, &disk];
+    if interactive {
+        println!("ocs-sr runs on this terminal: read its messages and answer its prompts.\n$ ocs-sr {}\n", ocs.join(" "));
+        let code = run_tty("ocs-sr", ocs)?;
+        if code != 0 {
+            return Err(format!("'ocs-sr savedisk' failed (exit code {code})"));
+        }
+    } else {
+        run(Ctx { dry: false }, "ocs-sr", ocs)?;
+    }
 
     // make the new image visible to the targets
     crate::install::setup_nfs(&c, Ctx { dry: false })?;
@@ -328,6 +540,10 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
         }
         Some("status") => {
             status(&c);
+            Ok(())
+        }
+        Some("times") => {
+            show_times(&c);
             Ok(())
         }
         Some("reinstall") => {
@@ -368,6 +584,12 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             crate::install::report_missing(&c);
             Ok(())
         }
+        Some("import") => {
+            // run after putting a new netboot tarball / Clonezilla Live zip into NETBOOT_DIR / LIVESYSTEM_DIR
+            crate::install::import_boot_files(&c, Ctx { dry: false })?;
+            crate::install::report_missing(&c);
+            Ok(())
+        }
         Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
         Some("clone") => clone_image(c, &args[1..]),
         Some("binds") => {
@@ -383,7 +605,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | stop | grub | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -397,7 +619,13 @@ pub fn cgi_done() -> Result<(), String> {
         return Ok(());
     }
     match mark_done(&c, &mac) {
-        Ok(()) => print!("Content-Type: text/plain\r\n\r\nok {mac}\n"),
+        Ok(()) => {
+            // the host is marked either way; a failing time record must not fail the callback
+            if let Err(e) = record_deploy(&c, &mac) {
+                eprintln!("pxe-done: deploy time not recorded: {e}");
+            }
+            print!("Content-Type: text/plain\r\n\r\nok {mac}\n")
+        }
         Err(e) => print!("Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\n{e}\n"),
     }
     Ok(())
@@ -449,6 +677,10 @@ pub fn cgi_seed() -> Result<(), String> {
             }
             print!("Content-Type: text/plain\r\n\r\n{}", render::post_script(&c, &host, &mac));
         }
+        "start" => match mark_start(&c, &mac) {
+            Ok(()) => print!("Content-Type: text/plain\r\n\r\nstart {mac}\n"),
+            Err(e) => cgi_error("500 Internal Server Error", &e),
+        },
         _ => cgi_error("404 Not Found", "unknown file"),
     }
     Ok(())
@@ -499,6 +731,39 @@ mod tests {
         assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:02"), None);
         assert_eq!(hostname_for(&c, "aa:bb:cc:dd:ee:09"), None);
         assert!(bind(&c, "aa:bb:cc:dd:ee:03", "192.168.5.13", "Bad_Name", false).is_err());
+    }
+
+    #[test]
+    fn deploy_time_from_start_to_done() {
+        let c = tmp_cfg("times");
+        let (a, b) = ("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02");
+        // a: started 125 s ago, then done -> one history line with ~125 s, start file gone
+        mark_start(&c, a).unwrap();
+        fs::write(format!("{}/{a}", start_dir(&c)), format!("{}\n2026-01-01T00:00:00+00:00\n", now_epoch() - 125)).unwrap();
+        record_deploy(&c, a).unwrap();
+        // b: done without any recorded start -> line with empty start/elapsed, not an error
+        record_deploy(&c, b).unwrap();
+        // a second deploy of a is appended, not overwritten
+        mark_start(&c, a).unwrap();
+        record_deploy(&c, a).unwrap();
+
+        let h = deploy_history(&c);
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].0, a);
+        assert!(matches!(h[0].3, Some(s) if (125..130).contains(&s)));
+        assert_eq!(h[0].1, "2026-01-01T00:00:00+00:00");
+        assert_eq!((h[1].0.as_str(), h[1].1.as_str(), h[1].3), (b, "", None));
+        assert!(h[2].3.is_some());
+        assert!(read_start(&c, a).is_none());
+        // the start files and the csv are not MAC markers
+        assert!(list_done(&c).is_empty());
+    }
+
+    #[test]
+    fn elapsed_format() {
+        assert_eq!(fmt_elapsed(45), "45s");
+        assert_eq!(fmt_elapsed(725), "12m 05s");
+        assert_eq!(fmt_elapsed(3725), "1h 02m 05s");
     }
 
     #[test]

@@ -93,7 +93,8 @@ fn forward<R: std::io::Read + Send + 'static>(r: R, tx: Sender<Msg>) -> thread::
 fn spawn_stream(mut cmd: Command, cleanup: Option<PathBuf>) -> Receiver<Msg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // stdin = /dev/null: a stray prompt must get EOF, never wait on the GUI's (invisible) terminal
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let code = match cmd.spawn() {
             Ok(mut child) => {
                 let mut readers = Vec::new();
@@ -432,8 +433,8 @@ fn install_tab() -> gtk::Widget {
         install_btn.connect_clicked(move |_| {
             run_installer(
                 "install",
-                4.0,
-                "Packages installed; services stopped. NOW COPY the netboot files and Clonezilla Live by hand (the log below lists where), then click \"Start PXE server\".",
+                7.0,
+                "Packages installed, netboot files and Clonezilla Live unpacked from /boot/netboot and /boot/livesystem; services stopped. Anything the log lists as missing must be copied by hand. Then click \"Start PXE server\".",
                 Ok(Config::default()),
                 &ui,
             )
@@ -462,6 +463,65 @@ fn run_ctl(args: Vec<String>, log: &gtk::TextView) {
     pump(rx, move |line| append(&l1, line), move |_| append(&l2, "\n"));
 }
 
+/// Terminal emulators and the flag that makes them run the rest of the command line (first found wins).
+const TERMINALS: [(&str, &str); 7] = [
+    ("x-terminal-emulator", "-e"),
+    ("gnome-terminal", "--"),
+    ("konsole", "-e"),
+    ("xfce4-terminal", "-x"),
+    ("mate-terminal", "-x"),
+    ("alacritty", "-e"),
+    ("xterm", "-e"),
+];
+
+fn have_command(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", "command -v \"$1\" >/dev/null", "sh", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run `pxe-installer ctl <args>` in a terminal window the user can see and type into (fsck / ocs-sr prompts).
+/// The window asks for the sudo password itself when needed and stays open until Enter is pressed, so the
+/// output can still be read when the command has finished or failed.
+fn run_ctl_terminal(args: Vec<String>, log: &gtk::TextView) {
+    let Some(installer) = find_installer() else {
+        append(log, "pxe-installer binary not found.\n");
+        return;
+    };
+    let Some((term, flag)) = TERMINALS.iter().find(|(t, _)| have_command(t)) else {
+        append(
+            log,
+            &format!(
+                "No terminal emulator found. Open a terminal yourself and run:\n  sudo pxe-ctl {}\n",
+                args.join(" ")
+            ),
+        );
+        return;
+    };
+    // "$@" = installer + ctl + args, passed as separate words: nothing is re-parsed by a shell
+    let script = "if [ \"$(id -u)\" = 0 ]; then \"$@\"; else sudo \"$@\"; fi; rc=$?; \
+                  echo; echo \"Finished (exit code $rc). Press Enter to close this window.\"; read _; exit $rc";
+    append(log, &format!("$ pxe-ctl {}   (in a terminal window: {term})\n", args.join(" ")));
+    match Command::new(term)
+        .arg(flag)
+        .args(["sh", "-c", script, "sh"])
+        .arg(&installer)
+        .arg("ctl")
+        .args(&args)
+        .spawn()
+    {
+        Ok(mut child) => {
+            // reap it when the window closes (no zombie); the result is in the terminal itself
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => append(log, &format!("cannot start {term}: {e}\n")),
+    }
+}
+
 fn manage_tab() -> gtk::Widget {
     let (log, log_sw) = log_view();
 
@@ -469,6 +529,7 @@ fn manage_tab() -> gtk::Widget {
     for (label, args) in [
         ("Host status", vec!["status"]),
         ("Installed hosts", vec!["list"]),
+        ("Deploy times", vec!["times"]),
         ("MAC bindings", vec!["binds"]),
         ("Re-export images (NFS)", vec!["nfs"]),
         ("Deploy way: show", vec!["mode"]),
@@ -544,7 +605,8 @@ fn manage_tab() -> gtk::Widget {
     let clone_btn = gtk::Button::with_label("Clone Image");
     clone_btn.add_css_class("suggested-action");
     clone_btn.set_tooltip_text(Some(
-        "Runs: ocs-sr -q2 -j2 -z9p -sfsck -senc -p true savedisk <image name> <disk>, then re-exports the image folder over NFS. \
+        "Opens a terminal window: first `fsck -f` of every partition of the disk (answer its questions or fix a problem right there), \
+         then `ocs-sr savedisk` with its own prompts, then the image folder is re-exported over NFS. \
          The disk must be idle (not mounted, no swap). It is only read. This takes a long time for a big disk.",
     ));
     {
@@ -555,12 +617,12 @@ fn manage_tab() -> gtk::Widget {
                 append(&log, "Enter the source disk name first (e.g. sda).\n");
                 return;
             }
-            // --yes: no confirmation prompt (there is no terminal to answer it)
-            let mut args = vec!["clone".to_string(), d, "--yes".to_string()];
+            // no --yes: the CLI runs interactively in the terminal window (fsck prompts, ocs-sr prompts)
+            let mut args = vec!["clone".to_string(), d];
             if clone_force.is_active() {
                 args.push("--force".to_string());
             }
-            run_ctl(args, &log);
+            run_ctl_terminal(args, &log);
         });
     }
     let clone_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);

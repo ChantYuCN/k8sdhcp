@@ -43,7 +43,9 @@ log-dhcp
 // (root = tmpfs overlay), or `netboot=nfs nfsroot=` mounts the extracted Clonezilla Live folder from the
 // server over NFS (diskless root, no RAM copy). After the restore Clonezilla runs post.sh (generated per MAC by `cgi-seed`): it gives
 // the clone its own hostname / machine-id / SSH host keys and calls pxe-done, which creates the marker
-// that makes the guard at the top of this file skip the host on its next PXE boot.
+// that makes the guard at the top of this file skip the host on its next PXE boot. The restore entry also
+// calls pxe-seed/<mac>/start (ocs_prerun1) when Clonezilla comes up: that is the start of the deploy time
+// the server records per MAC (start -> pxe-done, see `pxe-ctl times`).
 //
 // There is no `ip=` argument on purpose: with fetch= the live-boot initramfs configures the network with
 // DHCP by itself. `ip=dhcp` is read as a device name ("ip: can't find device 'dhcp'") and an empty `ip=`
@@ -74,7 +76,7 @@ menuentry "Clonezilla Live (interactive - nothing is changed automatically)" {
 }
 menuentry "Restore @IMAGE_NAME@ to /dev/@TARGET_DISK@ (ERASES THE DISK)" {
     echo "Loading Clonezilla Live..."
-    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts= locales= @ROOT_ARGS@ ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_live_run=\"ocs-sr -g auto -e1 auto -e2 -batch -r -j2 -scr -p true restoredisk @IMAGE_NAME@ @TARGET_DISK@\" ocs_live_extra_param=\"\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
+    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts= locales= @ROOT_ARGS@ ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_prerun1=\"wget -q -T 5 -t 2 -O /dev/null http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/start\" ocs_live_run=\"ocs-sr -g auto -e1 auto -e2 -batch -r -j2 -scr -p true restoredisk @IMAGE_NAME@ @TARGET_DISK@\" ocs_live_extra_param=\"\" ocs_live_keymap=\"NONE\" ocs_lang=\"en_US.UTF-8\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
     initrd /clonezilla/initrd.img
 }
 menuentry "Boot from local disk" {
@@ -278,7 +280,15 @@ mod tests {
         // post-restore script is fetched per MAC; each command is its own ocs_postrunN
         assert!(s.contains("http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/post.sh"));
         assert!(s.contains(r#"ocs_postrun2=\"sh /tmp/post.sh\""#));
+        // the restore entry (only) tells the server when the deploy starts: elapsed time = done - start
+        assert_eq!(s.matches("/cgi-bin/pxe-seed/${net_default_mac}/start").count(), 1);
         assert!(s.contains(r#"ocs_postrun3=\"reboot\""#));
+        // the restore entry is hands-free: no keyboard/language question, batch mode, no confirmation
+        let restore = s.lines().find(|l| l.contains("restoredisk")).unwrap();
+        for p in [r#"ocs_live_keymap=\"NONE\""#, r#"ocs_lang=\"en_US.UTF-8\""#, r#"ocs_live_batch=\"yes\""#, " -batch "] {
+            assert!(restore.contains(p), "restore entry lacks {p}");
+        }
+        assert!(!restore.contains(" -c "), "a confirmation prompt would stop the unattended restore");
         // exactly one entry restores (and so erases) a disk
         assert_eq!(s.matches("restoredisk").count(), 1);
         // GRUB operators (&& ; | &) must not appear in the kernel lines
