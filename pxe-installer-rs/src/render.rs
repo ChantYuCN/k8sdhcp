@@ -572,8 +572,11 @@ mod tests {
         // the file content: eth0, the bound address, no DHCP; netplan wants it private
         assert!(s.contains("    eth0:\n      addresses:\n      - $ip_cidr\n      dhcp4: false\nEOF\n"));
         assert!(s.contains("chmod 600 $T/etc/netplan/01-pxe-server-mac-binding.yaml"));
-        // all of it is before the unmount and the done callback
-        assert!(new < s.find("umount $T\n").unwrap());
+        // all of it is before the FINAL unmount (the first `umount $T` is in the root-filesystem search loop) and
+        // before the done callback
+        let final_umount = s.rfind("umount $T\n").unwrap();
+        assert!(new < final_umount);
+        assert!(final_umount < s.find("pxe-done?mac=").unwrap());
 
         // unbound MAC: empty address, the script does nothing to the netplan files
         let u = post_script(&cfg(), "node07", "aa:bb:cc:dd:ee:01", "");
