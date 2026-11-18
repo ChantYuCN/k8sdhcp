@@ -3,11 +3,10 @@ use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
-use crate::config::{is_disk_name, is_hostname, is_image_name, is_mac, normalize_mac, Config, RootMode};
+use crate::config::{is_disk_name, is_hostname, is_image_name, is_mac, normalize_mac, Binding, CastMode, Config, RootMode};
 use crate::render;
 use crate::util::{fmt_elapsed, mkdir, now_epoch, now_iso, output, probe, run, run_soft, run_tty, step, warn, write_file, Ctx};
 
-const LEASES: &str = "/var/lib/misc/dnsmasq.leases";
 
 fn need_mac(arg: Option<&String>) -> Result<String, String> {
     let mac = normalize_mac(arg.ok_or("MAC address required")?);
@@ -134,27 +133,42 @@ fn show_times(c: &Config) {
     }
 }
 
-/// Prefix of every binding line in the hosts file (it is loaded with `conf-file=`).
-const HOST_PREFIX: &str = "dhcp-host=";
+/// Binding lines written by the dnsmasq versions of this tool carry this prefix; it is still accepted (and
+/// dropped) when the hosts file is read, so old bindings survive the move to Kea.
+const LEGACY_HOST_PREFIX: &str = "dhcp-host=";
 
-/// Bindings as "mac,ip[,name]" (prefix stripped; comments/blank lines skipped; old unprefixed lines accepted).
+/// Bindings as "mac,ip[,name]" (comments/blank lines skipped, legacy prefix stripped). The hosts file is our
+/// own store; Kea only ever sees the reservations generated from it (`apply_dhcp`).
 fn read_hosts(c: &Config) -> Vec<String> {
     fs::read_to_string(&c.hosts_file)
         .map(|t| {
             t.lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| l.strip_prefix(HOST_PREFIX).unwrap_or(l).to_string())
+                .map(|l| l.strip_prefix(LEGACY_HOST_PREFIX).unwrap_or(l).to_string())
                 .collect()
         })
         .unwrap_or_default()
 }
 
+/// The bindings as DHCP reservations (a line without a valid "mac,ip" is skipped).
+pub fn read_bindings(c: &Config) -> Vec<Binding> {
+    read_hosts(c)
+        .iter()
+        .filter_map(|l| {
+            let mut f = l.split(',');
+            let mac = normalize_mac(f.next()?);
+            let ip = f.next()?.trim().to_string();
+            let hostname = f.next().unwrap_or("").trim().to_string();
+            (is_mac(&mac) && is_ip(&ip)).then_some(Binding { mac, ip, hostname })
+        })
+        .collect()
+}
+
 fn write_hosts(c: &Config, lines: &[String]) -> Result<(), String> {
     let tmp = format!("{}.tmp", c.hosts_file);
-    let mut body = String::from("# managed by pxe-installer (pxe-ctl bind / unbind) - dnsmasq dhcp-host entries\n");
+    let mut body = String::from("# managed by pxe-installer (pxe-ctl bind / unbind): mac,ip[,hostname] per line\n");
     for l in lines {
-        body.push_str(HOST_PREFIX);
         body.push_str(l);
         body.push('\n');
     }
@@ -165,10 +179,33 @@ fn write_hosts(c: &Config, lines: &[String]) -> Result<(), String> {
     fs::rename(&tmp, &c.hosts_file).map_err(|e| format!("rename {tmp}: {e}"))
 }
 
-fn reload_dnsmasq() {
-    // dhcp-host lines in a conf-file are only read at startup (SIGHUP does not re-read them),
-    // so restart. Leases are kept in dnsmasq's lease file and survive. No-op if not installed yet.
-    run_soft(Ctx { dry: false }, "systemctl", &["restart", "dnsmasq"]);
+/// Regenerate the Kea config from the current bindings and make Kea load it. The new file is checked with
+/// `kea-dhcp4 -t` first and only then put in place, so a mistake never replaces a working config. A Kea
+/// config that was not written by `start` (no marker) is left alone: `start` will write ours.
+pub fn apply_dhcp(c: &Config) -> Result<(), String> {
+    let ctx = Ctx { dry: false };
+    if c.cast_mode == CastMode::Multicast {
+        println!("note: multicast mode: DHCP is served by DRBL, so the binding only sets the hostname the clone gets");
+        return Ok(());
+    }
+    let current = fs::read_to_string(render::KEA_CONF_PATH).unwrap_or_default();
+    if !current.starts_with(render::GENERATED_MARK) {
+        println!("note: the DHCP server is not configured yet (run Start); the binding is saved and applied then");
+        return Ok(());
+    }
+    let new = format!("{}.new", render::KEA_CONF_PATH);
+    write_file(ctx, &new, &render::kea_conf(c, &read_bindings(c)), 0o644, false)?;
+    if let Err(e) = run(ctx, "kea-dhcp4", &["-t", &new]) {
+        let _ = fs::remove_file(&new);
+        return Err(format!("the new DHCP config was rejected and NOT applied (the bindings file is saved): {e}"));
+    }
+    fs::rename(&new, render::KEA_CONF_PATH).map_err(|e| format!("rename {new}: {e}"))?;
+    // SIGHUP re-reads the config without dropping leases; falls back to a restart if the unit cannot reload.
+    // Only when Kea runs: with the PXE server stopped, a binding must not start it again.
+    if service_active(render::DHCP_SERVICE) {
+        run_soft(ctx, "systemctl", &["reload-or-restart", render::DHCP_SERVICE]);
+    }
+    Ok(())
 }
 
 /// Add or replace a binding (an existing line with the same MAC or IP is dropped first).
@@ -193,10 +230,10 @@ pub fn bind(c: &Config, mac: &str, ip: &str, name: &str, reload: bool) -> Result
         .collect();
     lines.push(if name.is_empty() { format!("{mac},{ip}") } else { format!("{mac},{ip},{name}") });
     write_hosts(c, &lines)?;
-    if reload {
-        reload_dnsmasq();
-    }
     println!("bound {mac} -> {ip}");
+    if reload {
+        apply_dhcp(c)?;
+    }
     Ok(())
 }
 
@@ -212,9 +249,31 @@ fn unbind(c: &Config, key: &str) -> Result<(), String> {
         })
         .collect();
     write_hosts(c, &lines)?;
-    reload_dnsmasq();
     println!("unbound {key}");
-    Ok(())
+    apply_dhcp(c)
+}
+
+/// Active leases of Kea's memfile (CSV: address,hwaddr,client_id,valid_lifetime,expire,subnet_id,...,state).
+/// The file is a journal: a later line for the same address replaces the earlier one, and valid_lifetime 0
+/// (released) or a non-zero state (declined / expired-reclaimed) means the lease is gone.
+fn parse_leases(text: &str, now: u64) -> Vec<(String, String)> {
+    let mut latest: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() >= 10 {
+            latest.insert(f[0], f);
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, f)| f[3] != "0" && f[9] == "0" && f[4].parse::<u64>().map(|e| e > now).unwrap_or(false))
+        .map(|(ip, f)| (f[1].to_lowercase(), ip.to_string()))
+        .collect()
+}
+
+/// (mac, ip) of every active lease of the DHCP server.
+fn read_leases() -> Vec<(String, String)> {
+    parse_leases(&fs::read_to_string(render::KEA_LEASES_PATH).unwrap_or_default(), now_epoch())
 }
 
 fn list_done(c: &Config) -> Vec<(String, String)> {
@@ -235,26 +294,21 @@ fn list_done(c: &Config) -> Vec<(String, String)> {
 fn status(c: &Config) {
     let installed = list_done(c);
     let hosts = read_hosts(c);
-    // dnsmasq.leases: <expiry> <mac> <ip> <hostname> <client-id>
-    let leases: Vec<Vec<String>> = fs::read_to_string(LEASES)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
-        .filter(|f| f.len() >= 4)
-        .collect();
+    let leases = read_leases();
 
     let mut macs: Vec<String> = installed.iter().map(|(m, _)| m.clone()).collect();
     for l in &hosts {
         macs.push(l.split(',').next().unwrap_or("").to_lowercase());
     }
-    for f in &leases {
-        macs.push(f[1].to_lowercase());
+    for (mac, _) in &leases {
+        macs.push(mac.clone());
     }
     macs.retain(|m| is_mac(m));
     macs.sort();
     macs.dedup();
 
     let history = deploy_history(c);
+    println!("cast mode: {} (switch while the PXE server is stopped: pxe-ctl cast unicast|multicast)\n", c.cast_mode.as_str());
     println!("{:<18} {:<16} {:<16} {:<10} {:<26} {}", "MAC", "BOUND IP", "LEASE IP", "STATE", "INSTALLED AT", "DEPLOY TIME");
     for mac in &macs {
         let bound = hosts
@@ -262,7 +316,7 @@ fn status(c: &Config) {
             .find(|l| l.split(',').next().map(|m| m.eq_ignore_ascii_case(mac)).unwrap_or(false))
             .and_then(|l| l.split(',').nth(1))
             .unwrap_or("-");
-        let lease = leases.iter().find(|f| f[1].eq_ignore_ascii_case(mac)).map(|f| f[2].as_str()).unwrap_or("-");
+        let lease = leases.iter().find(|(m, _)| m.eq_ignore_ascii_case(mac)).map(|(_, ip)| ip.as_str()).unwrap_or("-");
         let done = installed.iter().find(|(m, _)| m == mac);
         let state = if done.is_some() {
             "installed"
@@ -311,6 +365,90 @@ fn switch_mode(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
         warn(&e);
     }
     crate::install::report_missing(&c);
+    Ok(())
+}
+
+/// DHCP server of a DRBL setup (multicast mode). It is not started by this tool, but it must be stopped too
+/// before the cast mode can change.
+const DRBL_DHCP_SERVICE: &str = "isc-dhcp-server";
+
+/// The services of either stack that are running right now (empty = the PXE server is stopped).
+pub fn running_pxe_services() -> Vec<&'static str> {
+    [render::DHCP_SERVICE, render::TFTP_SERVICE, "apache2", "nfs-server", DRBL_DHCP_SERVICE]
+        .into_iter()
+        .filter(|s| service_active(s))
+        .collect()
+}
+
+/// `ctl cast [unicast|multicast]` - show or switch how the image reaches the targets. Only allowed while the PXE
+/// server is stopped (`pxe-ctl stop`), so no target is being served by the old way when the mode changes.
+/// unicast = this tool serves the image over NFS (Kea + tftpd-hpa + Apache + NFS), one copy per target.
+/// multicast = one stream for all targets, served by DRBL + Clonezilla SE (see drbl-clonezilla-se-multicast-guide.md);
+/// `start` of this tool is refused in that mode, so Kea cannot fight DRBL's DHCP for the network.
+fn switch_cast(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
+    let Some(wanted) = wanted else {
+        println!("Cast mode: {}", c.cast_mode.as_str());
+        return Ok(());
+    };
+    let new = CastMode::parse(wanted)?;
+    if new == c.cast_mode {
+        println!("Cast mode is already {}", new.as_str());
+        return Ok(());
+    }
+    let running = running_pxe_services();
+    if !running.is_empty() {
+        return Err(format!(
+            "the PXE server is still running ({}): stop it first (pxe-ctl stop / the Stop button), then switch the cast mode",
+            running.join(", ")
+        ));
+    }
+    c.cast_mode = new;
+    let ctx = Ctx { dry: false };
+    write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
+    match new {
+        CastMode::Multicast => {
+            // Kea must not come back at boot and answer DHCP next to DRBL's server
+            run_soft(ctx, "systemctl", &["disable", render::DHCP_SERVICE]);
+            println!(
+                "Cast mode is now: multicast (one stream for all targets, DRBL + Clonezilla SE).\n\
+                 Start no longer starts Kea / TFTP: it sets up the callbacks and the DRBL pre/post-run scripts\n\
+                 (hostname, machine-id, SSH keys, done marker, deploy time); DRBL serves DHCP/TFTP and the session,\n\
+                 see drbl-clonezilla-se-multicast-guide.md (drblpush -i, then drbl-ocs ... multicast_restoredisk).\n\
+                 Switch back with: sudo pxe-ctl cast unicast (after stopping DRBL's DHCP: pxe-ctl stop)."
+            );
+        }
+        CastMode::Unicast => println!(
+            "Cast mode is now: unicast (every target restores its own copy over NFS).\n\
+             Run Start to serve it (DRBL's DHCP and TFTP must not run at the same time)."
+        ),
+    }
+    Ok(())
+}
+
+/// `ctl auto [on|off]` - show or switch AUTO_INSTALL. on = a PXE-booted host starts Clonezilla Live and restores
+/// the image onto TARGET_DISK by itself, no menu choice and no question (it ERASES the disk); off = the menu
+/// starts interactive Clonezilla and the restore entry has to be selected by hand. Applied at once to the next
+/// PXE boot (grub.cfg is rewritten); hosts that are already booted into Clonezilla are not affected.
+fn switch_auto(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
+    let describe = |on: bool| {
+        if on {
+            "ON: PXE-booted hosts restore the image onto /dev/{disk} by themselves (the disk is ERASED, nothing is asked)"
+        } else {
+            "OFF: the PXE menu starts interactive Clonezilla; the restore entry must be selected by hand"
+        }
+    };
+    if let Some(w) = wanted {
+        let on = match w {
+            "on" | "1" | "yes" | "true" => true,
+            "off" | "0" | "no" | "false" => false,
+            other => return Err(format!("'{other}' is not on or off")),
+        };
+        c.auto_install = on;
+        let ctx = Ctx { dry: false };
+        write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
+        write_grub(&c, ctx)?;
+    }
+    println!("Automatic restore is {}", describe(c.auto_install).replace("{disk}", &c.target_disk));
     Ok(())
 }
 
@@ -564,11 +702,22 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
         }
         Some("stop") => {
             // stop the PXE services (DHCP/TFTP + HTTP); they stay enabled and come back on reboot
-            run(Ctx { dry: false }, "systemctl", &["stop", "dnsmasq", "apache2", "nfs-server"])?;
-            for svc in ["dnsmasq", "apache2", "nfs-server"] {
-                println!("{svc}: {}", if service_active(svc) { "STILL ACTIVE" } else { "stopped" });
+            let services = [render::DHCP_SERVICE, render::TFTP_SERVICE, "apache2", "nfs-server"];
+            run(Ctx { dry: false }, "systemctl", &["stop", services[0], services[1], services[2], services[3]])?;
+            // multicast mode: DRBL's DHCP server counts as part of the PXE server too
+            if service_active(DRBL_DHCP_SERVICE) {
+                run_soft(Ctx { dry: false }, "systemctl", &["stop", DRBL_DHCP_SERVICE]);
             }
-            println!("PXE server stopped. Start it again with the Start button or: sudo systemctl start dnsmasq apache2");
+            for svc in services.into_iter().chain([DRBL_DHCP_SERVICE]) {
+                if svc != DRBL_DHCP_SERVICE || service_active(svc) {
+                    println!("{svc}: {}", if service_active(svc) { "STILL ACTIVE" } else { "stopped" });
+                }
+            }
+            println!(
+                "PXE server stopped. Start it again with the Start button or: sudo systemctl start {} {} apache2 nfs-server",
+                render::DHCP_SERVICE,
+                render::TFTP_SERVICE
+            );
             Ok(())
         }
         Some("grub") => {
@@ -591,10 +740,12 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
+        Some("auto") => switch_auto(c, args.get(1).map(|s| s.as_str())),
+        Some("cast") => switch_cast(c, args.get(1).map(|s| s.as_str())),
         Some("clone") => clone_image(c, &args[1..]),
         Some("binds") => {
             for l in read_hosts(&c) {
-                println!("{HOST_PREFIX}{l}");
+                println!("{l}");
             }
             Ok(())
         }
@@ -605,7 +756,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | auto [on|off] | cast [unicast|multicast] | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -646,6 +797,11 @@ fn hostname_for(c: &Config, mac: &str) -> Option<String> {
     None
 }
 
+/// IP bound to this MAC (`pxe-ctl bind <mac> <ip>`), if any. `read_bindings` only returns valid IPv4 addresses.
+fn ip_for(c: &Config, mac: &str) -> Option<String> {
+    read_bindings(c).into_iter().find(|b| b.mac == mac).map(|b| b.ip)
+}
+
 fn cgi_error(status: &str, msg: &str) {
     print!("Status: {status}\r\nContent-Type: text/plain\r\n\r\n{msg}\n");
 }
@@ -675,7 +831,9 @@ pub fn cgi_seed() -> Result<(), String> {
                 cgi_error("500 Internal Server Error", "invalid hostname or target disk in /etc/pxe-installer.conf");
                 return Ok(());
             }
-            print!("Content-Type: text/plain\r\n\r\n{}", render::post_script(&c, &host, &mac));
+            // the address bound to this MAC (pxe-ctl bind) becomes its static IP; none = keep the image's network config
+            let ip = ip_for(&c, &mac).unwrap_or_default();
+            print!("Content-Type: text/plain\r\n\r\n{}", render::post_script(&c, &host, &mac, &ip));
         }
         "start" => match mark_start(&c, &mac) {
             Ok(()) => print!("Content-Type: text/plain\r\n\r\nstart {mac}\n"),
@@ -713,6 +871,46 @@ mod tests {
         bind(&c, "aa:bb:cc:dd:ee:03", "192.168.5.12", "", false).unwrap(); // same IP as :02
         let l = read_hosts(&c);
         assert_eq!(l, vec!["aa:bb:cc:dd:ee:01,192.168.5.13,n1", "aa:bb:cc:dd:ee:03,192.168.5.12"]);
+    }
+
+    #[test]
+    fn bindings_become_reservations_and_legacy_lines_still_load() {
+        let c = tmp_cfg("resv");
+        // a hosts file as the dnsmasq versions wrote it, plus a junk line
+        fs::write(
+            &c.hosts_file,
+            "# managed\ndhcp-host=AA:BB:CC:DD:EE:01,192.168.5.11,n1\ndhcp-host=aa:bb:cc:dd:ee:02,192.168.5.12\nnonsense\n",
+        )
+        .unwrap();
+        bind(&c, "aa:bb:cc:dd:ee:03", "192.168.5.13", "n3", false).unwrap();
+        let r = read_bindings(&c);
+        let got: Vec<(&str, &str, &str)> = r.iter().map(|b| (b.mac.as_str(), b.ip.as_str(), b.hostname.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("aa:bb:cc:dd:ee:01", "192.168.5.11", "n1"),
+                ("aa:bb:cc:dd:ee:02", "192.168.5.12", ""),
+                ("aa:bb:cc:dd:ee:03", "192.168.5.13", "n3"),
+            ]
+        );
+        // new lines are written without the old dnsmasq prefix
+        assert!(!fs::read_to_string(&c.hosts_file).unwrap().contains("dhcp-host="));
+    }
+
+    #[test]
+    fn kea_leases_journal() {
+        let csv = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context\n\
+                   192.168.5.100,AA:BB:CC:DD:EE:01,,86400,2000,1,0,0,,0,\n\
+                   192.168.5.101,aa:bb:cc:dd:ee:02,,86400,2000,1,0,0,,0,\n\
+                   192.168.5.102,aa:bb:cc:dd:ee:03,,86400,500,1,0,0,,0,\n\
+                   192.168.5.103,aa:bb:cc:dd:ee:04,,86400,2000,1,0,0,,1,\n\
+                   192.168.5.101,aa:bb:cc:dd:ee:02,,0,2000,1,0,0,,0,\n\
+                   192.168.5.100,aa:bb:cc:dd:ee:01,,86400,3000,1,0,0,,0,\n";
+        // now = 1000: .100 (renewed, later line wins) is active; .101 was released (lifetime 0 in a later line);
+        // .102 expired at 500; .103 is declined (state 1)
+        assert_eq!(parse_leases(csv, 1000), vec![("aa:bb:cc:dd:ee:01".to_string(), "192.168.5.100".to_string())]);
+        assert!(parse_leases("", 1000).is_empty());
+        assert!(parse_leases("address,hwaddr\n", 1000).is_empty());
     }
 
     #[test]
