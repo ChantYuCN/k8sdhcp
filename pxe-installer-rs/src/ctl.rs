@@ -354,23 +354,32 @@ const OCS_ROOT: &str = "/home/partimag";
 /// Only one capture at a time (the GUI button could be clicked twice). /run is a tmpfs: gone after a reboot.
 const CLONE_LOCK: &str = "/run/pxe-installer-clone.lock";
 
-/// Arguments of `ctl clone`: (disk name without /dev/, --yes, --force).
-fn parse_clone_args(args: &[String]) -> Result<(String, bool, bool), String> {
+/// Arguments of `ctl clone`: (disk name without /dev/, --yes, --force, --image NAME).
+fn parse_clone_args(args: &[String]) -> Result<(String, bool, bool, Option<String>), String> {
     let mut disk: Option<String> = None;
+    let mut image: Option<String> = None;
     let (mut yes, mut force) = (false, false);
-    for a in args {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--yes" => yes = true,
             "--force" => force = true,
+            "--image" => {
+                let name = it.next().ok_or("--image needs an image name")?;
+                if !is_image_name(name) {
+                    return Err(format!("'{name}' is not a valid image name (letters, digits, '.', '_' and '-')"));
+                }
+                image = Some(name.clone());
+            }
             d if !d.starts_with('-') && disk.is_none() => disk = Some(d.trim_start_matches("/dev/").to_string()),
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
-    let disk = disk.ok_or("disk name required, e.g.: pxe-ctl clone nvme0n2 [--yes] [--force]")?;
+    let disk = disk.ok_or("disk name required, e.g.: pxe-ctl clone nvme0n2 [--image NAME] [--yes] [--force]")?;
     if !is_disk_name(&disk) {
         return Err(format!("'{disk}' is not a disk name (use e.g. sda or nvme0n2, lowercase letters and digits)"));
     }
-    Ok((disk, yes, force))
+    Ok((disk, yes, force, image))
 }
 
 /// Removes the clone lock when the capture ends (or fails).
@@ -468,15 +477,18 @@ fn check_filesystems(dev: &str, interactive: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `ctl clone <disk> [--yes] [--force]` - capture <disk> of THIS host into the Clonezilla image repository as
-/// IMAGE_NAME (`ocs-sr savedisk`, partclone + parallel zstd) and re-export the repository over NFS, so the
+/// `ctl clone <disk> [--image NAME] [--yes] [--force]` - capture <disk> of THIS host into the Clonezilla image
+/// repository as NAME (default IMAGE_NAME; `ocs-sr savedisk`, partclone + parallel zstd) and re-export the repository over NFS, so the
 /// targets can restore it. The disk is only read, but it must be idle: not mounted, no swap, not in use.
 /// Default = interactive, on the terminal it is run from: `fsck -f` of every filesystem first (the user
 /// fixes problems right there), then `ocs-sr` with its own prompts. `--yes` runs without any prompt
 /// (read-only fsck that aborts on a problem, `ocs-sr -batch`); `--force` replaces an existing image of the
 /// same name (interactive: it is asked, non-interactive without --force it is an error).
-fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
-    let (disk, yes, force) = parse_clone_args(args)?;
+fn clone_image(mut c: Config, args: &[String]) -> Result<(), String> {
+    let (disk, yes, force, image_name) = parse_clone_args(args)?;
+    if let Some(name) = image_name {
+        c.image_name = name;
+    }
     if !is_image_name(&c.image_name) {
         return Err(format!("IMAGE_NAME '{}' is not valid", c.image_name));
     }
@@ -528,7 +540,7 @@ fn clone_image(c: Config, args: &[String]) -> Result<(), String> {
     if replace && !force {
         if !interactive {
             return Err(format!(
-                "image {image} already exists: delete it first (sudo rm -rf {image}) or use --force / the \"Overwrite\" box"
+                "image {image} already exists: delete it first (sudo rm -rf {image}) or use --force"
             ));
         }
         if ask(&format!("image {image} already exists. Replace it? [y/n] "), "yn")? != 'y' {
@@ -644,7 +656,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -878,8 +890,19 @@ mod tests {
     #[test]
     fn clone_args() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
-        assert_eq!(parse_clone_args(&a(&["sda"])).unwrap(), ("sda".to_string(), false, false));
-        assert_eq!(parse_clone_args(&a(&["/dev/nvme0n2", "--yes", "--force"])).unwrap(), ("nvme0n2".to_string(), true, true));
+        assert_eq!(parse_clone_args(&a(&["sda"])).unwrap(), ("sda".to_string(), false, false, None));
+        assert_eq!(
+            parse_clone_args(&a(&["/dev/nvme0n2", "--yes", "--force"])).unwrap(),
+            ("nvme0n2".to_string(), true, true, None)
+        );
+        // the image name comes from the GUI's "Image name" field
+        assert_eq!(
+            parse_clone_args(&a(&["sda", "--image", "golden-2", "--force"])).unwrap(),
+            ("sda".to_string(), false, true, Some("golden-2".to_string()))
+        );
+        assert!(parse_clone_args(&a(&["sda", "--image"])).is_err()); // name missing
+        assert!(parse_clone_args(&a(&["sda", "--image", "../x"])).is_err()); // not a plain folder name
+        assert!(parse_clone_args(&a(&["sda", "--image", "a b"])).is_err());
         assert_eq!(parse_clone_args(&a(&["--yes", "sdb"])).unwrap().0, "sdb");
         assert!(parse_clone_args(&a(&[])).is_err()); // no disk
         assert!(parse_clone_args(&a(&["--yes"])).is_err());

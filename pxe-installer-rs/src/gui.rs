@@ -198,6 +198,36 @@ fn text_of(e: &gtk::Entry) -> String {
     e.text().to_string()
 }
 
+/// Names of the image folders inside `dir` (plain folder names only), sorted.
+fn list_images(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| pxe_installer::config::is_image_name(n))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The image selected in the drop-down ("" when the list is empty).
+fn selected_image(list: &gtk::StringList, dd: &gtk::DropDown) -> String {
+    list.string(dd.selected()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// (Re)load the drop-down from the image folder and select `prefer` when it is there.
+fn fill_images(list: &gtk::StringList, dd: &gtk::DropDown, dir: &str, prefer: &str) {
+    let names = list_images(dir);
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    list.splice(0, list.n_items(), &refs);
+    if let Some(i) = names.iter().position(|n| n == prefer) {
+        dd.set_selected(i as u32);
+    }
+}
+
 fn interfaces() -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir("/sys/class/net")
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
@@ -221,7 +251,9 @@ struct Form {
     static_ip: gtk::CheckButton,
     only_known: gtk::CheckButton,
     t_host: gtk::Entry,
-    image: gtk::Entry,
+    /// Clonezilla image: a drop-down list of the folders in /home/partimag (`image_list` holds the names)
+    image: gtk::DropDown,
+    image_list: gtk::StringList,
     disk: gtk::Entry,
 }
 
@@ -238,7 +270,12 @@ impl Form {
         c.set_static_ip = self.static_ip.is_active();
         c.only_known_hosts = self.only_known.is_active();
         c.target_hostname = text_of(&self.t_host).trim().to_string();
-        c.image_name = text_of(&self.image).trim().to_string();
+        c.image_name = selected_image(&self.image_list, &self.image);
+        if c.image_name.is_empty() {
+            return Err("Select a Clonezilla image. The list is empty: no image folder was found in /home/partimag \
+                        (make one with Clone Image on the Manage tab, or copy one there, then press Refresh)."
+                .to_string());
+        }
         c.target_disk = text_of(&self.disk).trim().trim_start_matches("/dev/").to_string();
         // the deploy way (tmpfs / NFS) is switched on the Manage tab; Start must keep what is saved there
         c.root_mode = Config::load_runtime().root_mode;
@@ -351,12 +388,29 @@ fn install_tab() -> gtk::Widget {
 
     let tgt = gtk::Grid::builder().column_spacing(8).row_spacing(6).build();
     let t_host = entry(&d.target_hostname);
-    let image = entry(&d.image_name);
     let disk = entry(&d.target_disk);
-    image.set_tooltip_text(Some("Folder name of the Clonezilla image inside /home/partimag (made with ocs-sr savedisk)"));
     disk.set_tooltip_text(Some("Disk of the target that is erased and restored, e.g. nvme0n1 or sda"));
+    // Clonezilla image: pick one of the image folders in /home/partimag (made with Clone Image / ocs-sr savedisk);
+    // the saved image of the running server is preselected
+    let saved = Config::load_runtime();
+    let image_list = gtk::StringList::new(&[]);
+    let image = gtk::DropDown::builder().model(&image_list).hexpand(true).build();
+    fill_images(&image_list, &image, &saved.image_dir, &saved.image_name);
+    image.set_tooltip_text(Some("Select the Clonezilla image (a folder inside /home/partimag) that is restored onto the targets"));
+    let refresh = gtk::Button::with_label("Refresh");
+    refresh.set_tooltip_text(Some("Read the image folder again (for example after Clone Image made a new image)"));
+    {
+        let (image_list, image, dir) = (image_list.clone(), image.clone(), saved.image_dir.clone());
+        refresh.connect_clicked(move |_| {
+            let keep = selected_image(&image_list, &image);
+            fill_images(&image_list, &image, &dir, &keep);
+        });
+    }
+    let image_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    image_row.append(&image);
+    image_row.append(&refresh);
     grid_row(&tgt, 0, "Default hostname (no binding)", &t_host);
-    grid_row(&tgt, 1, "Clonezilla image name", &image);
+    grid_row(&tgt, 1, "Clonezilla image (/home/partimag/...)", &image_row);
     grid_row(&tgt, 2, "Target disk (/dev/...)", &disk);
     let warn = gtk::Label::builder()
         .xalign(0.0)
@@ -399,7 +453,7 @@ fn install_tab() -> gtk::Widget {
 
     let form = Form {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
-        t_host, image, disk,
+        t_host, image, image_list, disk,
     };
 
     let ui = Rc::new(RunUi { log, step_label, progress, buttons: vec![install_btn.clone(), start_btn.clone()] });
@@ -508,6 +562,8 @@ fn run_ctl_terminal(args: Vec<String>, log: &gtk::TextView) {
     }
 }
 
+// MessageDialog is deprecated since GTK 4.10 (AlertDialog needs the v4_10 feature of the gtk4 crate); it still works
+#[allow(deprecated)]
 fn manage_tab() -> gtk::Widget {
     let (log, log_sw) = log_view();
 
@@ -586,34 +642,77 @@ fn manage_tab() -> gtk::Widget {
     // then re-export the repository over NFS so the targets can restore it.
     let clone_disk = entry("");
     clone_disk.set_placeholder_text(Some("source disk of this server, e.g. sda or nvme0n2"));
-    let clone_force = gtk::CheckButton::with_label("Overwrite the existing image");
-    clone_force.set_tooltip_text(Some("Without this an image that already exists is never replaced"));
+    // the image name is typed here: it becomes a new folder in /home/partimag
+    let clone_name = entry("");
+    clone_name.set_placeholder_text(Some("image name, e.g. cri-golden (new folder in /home/partimag)"));
     let clone_btn = gtk::Button::with_label("Clone Image");
     clone_btn.add_css_class("suggested-action");
     clone_btn.set_tooltip_text(Some(
         "Opens a terminal window: first `fsck -f` of every partition of the disk (answer its questions or fix a problem right there), \
          then `ocs-sr savedisk` with its own prompts, then the image folder is re-exported over NFS. \
+         If an image with this name already exists you are asked whether to overwrite it. \
          The disk must be idle (not mounted, no swap). It is only read. This takes a long time for a big disk.",
     ));
     {
-        let (log, clone_disk, clone_force) = (log.clone(), clone_disk.clone(), clone_force.clone());
-        clone_btn.connect_clicked(move |_| {
+        let (log, clone_disk, clone_name) = (log.clone(), clone_disk.clone(), clone_name.clone());
+        clone_btn.connect_clicked(move |btn| {
             let d = text_of(&clone_disk).trim().trim_start_matches("/dev/").to_string();
+            let name = text_of(&clone_name).trim().to_string();
             if d.is_empty() {
                 append(&log, "Enter the source disk name first (e.g. sda).\n");
                 return;
             }
-            // no --yes: the CLI runs interactively in the terminal window (fsck prompts, ocs-sr prompts)
-            let mut args = vec!["clone".to_string(), d];
-            if clone_force.is_active() {
-                args.push("--force".to_string());
+            if name.is_empty() {
+                append(&log, "Enter the image name first (it becomes a folder in /home/partimag).\n");
+                return;
             }
-            run_ctl_terminal(args, &log);
+            if !pxe_installer::config::is_image_name(&name) {
+                append(&log, "The image name may only contain letters, digits, '.', '_' and '-' (no spaces, no '/').\n");
+                return;
+            }
+            // start the capture in a terminal window; no --yes: fsck and ocs-sr run interactively there
+            let start = {
+                let (log, d, name) = (log.clone(), d.clone(), name.clone());
+                move |overwrite: bool| {
+                    let mut args = vec!["clone".to_string(), d.clone(), "--image".to_string(), name.clone()];
+                    if overwrite {
+                        args.push("--force".to_string());
+                    }
+                    run_ctl_terminal(args, &log);
+                }
+            };
+            let dir = Config::load_runtime().image_dir;
+            if !std::path::Path::new(&dir).join(&name).exists() {
+                start(false);
+                return;
+            }
+            // the image exists: ask before anything is deleted
+            let parent = btn.ancestor(gtk::Window::static_type()).and_then(|w| w.downcast::<gtk::Window>().ok());
+            let dialog = gtk::MessageDialog::builder()
+                .modal(true)
+                .message_type(gtk::MessageType::Question)
+                .buttons(gtk::ButtonsType::YesNo)
+                .text(format!("The image \"{name}\" already exists in {dir}."))
+                .secondary_text("Overwrite it? The old image is deleted when the new capture starts (after the disk check).")
+                .build();
+            if let Some(p) = &parent {
+                dialog.set_transient_for(Some(p));
+            }
+            let log = log.clone();
+            dialog.connect_response(move |dlg, answer| {
+                dlg.close();
+                if answer == gtk::ResponseType::Yes {
+                    start(true);
+                } else {
+                    append(&log, "Clone cancelled: the existing image was kept.\n");
+                }
+            });
+            dialog.present();
         });
     }
     let clone_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     clone_row.append(&clone_disk);
-    clone_row.append(&clone_force);
+    clone_row.append(&clone_name);
     clone_row.append(&clone_btn);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);

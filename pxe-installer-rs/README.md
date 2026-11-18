@@ -83,7 +83,7 @@ sudo pxe-ctl clone nvme0n2                  # capture disk nvme0n2 of THIS serve
 sudo ocs-sr -q2 -c -j2 -z9p -sfsck -senc -p true savedisk cri-golden nvme0n2   # -> /home/partimag/cri-golden/
 sudo pxe-ctl nfs                            # (re-)export /home/partimag read-only over NFS
 ```
-`pxe-ctl clone <disk> [--yes] [--force]` (also the **Clone Image** button and its disk field on the GUI's
+`pxe-ctl clone <disk> [--image NAME] [--yes] [--force]` (also the **Clone Image** button with its disk and image-name fields on the GUI's
 Manage tab, which opens a terminal window for it) works **interactively on the terminal**, in two stages, and
 then re-exports `IMAGE_DIR` over NFS:
 1. `fsck -f` on every filesystem of the disk, one after the other. fsck asks its own questions, so a problem
@@ -93,7 +93,7 @@ then re-exports `IMAGE_DIR` over NFS:
 
 Before it starts it refuses a disk that is not a whole disk, is mounted or holds swap (an OS disk that is
 running must be imaged from Clonezilla Live instead). If `IMAGE_NAME` already exists it asks whether to replace
-it (`--force` / the "Overwrite" checkbox answers yes); the old image is only deleted after fsck succeeded. The
+it (the GUI shows a message box asking whether to overwrite; `--force` answers yes); the old image is only deleted after fsck succeeded. The
 disk itself is only read. `--yes` runs without any prompt (read-only `fsck -f -n` that aborts on the first
 problem, `ocs-sr -batch`) for scripts. Only one clone runs at a time, and `IMAGE_DIR` has to be
 `/home/partimag`, where `ocs-sr` saves images.
@@ -131,7 +131,7 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ```
 ./target/release/pxe-installer-gui
 ```
-Install tab: network/DHCP, default hostname, image name, target disk (the deploy way, tmpfs or NFS, is switched on the Manage tab and Start keeps it) ->
+Install tab: network/DHCP, default hostname, the Clonezilla image (a drop-down of the folders in `/home/partimag`, with a Refresh button), target disk (the deploy way, tmpfs or NFS, is switched on the Manage tab and Start keeps it) ->
 **Install** (packages, directories, then the netboot tarball in `netboot/` and the Clonezilla Live zip
 in `livesystem/` next to the program are unpacked; services stopped) -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
@@ -149,7 +149,7 @@ sudo pxe-ctl status                          # per-host: installed / pending / w
 sudo pxe-ctl times                           # deploy time of every MAC (all runs, plus deploys still running)
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
-sudo pxe-ctl grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | stop
+sudo pxe-ctl grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force] | stop
   # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
