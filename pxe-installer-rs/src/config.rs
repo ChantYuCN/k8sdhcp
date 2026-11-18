@@ -37,32 +37,6 @@ impl RootMode {
     }
 }
 
-/// How the image reaches the targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CastMode {
-    /// every target pulls its own copy over NFS; served by this tool (Kea + tftpd-hpa + Apache + NFS)
-    Unicast,
-    /// one multicast stream for all targets; served by DRBL + Clonezilla SE (this tool's `start` stays out of the way)
-    Multicast,
-}
-
-impl CastMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CastMode::Unicast => "unicast",
-            CastMode::Multicast => "multicast",
-        }
-    }
-
-    pub fn parse(v: &str) -> Result<CastMode, String> {
-        match v.trim().to_lowercase().as_str() {
-            "unicast" | "uni" => Ok(CastMode::Unicast),
-            "multicast" | "multi" => Ok(CastMode::Multicast),
-            other => Err(format!("CAST_MODE: '{other}' is not valid (use unicast or multicast)")),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub iface: String,
@@ -87,9 +61,6 @@ pub struct Config {
     pub target_disk: String,
     /// How the target gets Clonezilla Live: `Tmpfs` (HTTP download into RAM) or `Nfs` (NFS root)
     pub root_mode: RootMode,
-    /// `Unicast` (this tool serves the image over NFS) or `Multicast` (DRBL + Clonezilla SE serves it; `start` is
-    /// refused). Only switchable while the PXE server is stopped (`pxe-ctl cast`).
-    pub cast_mode: CastMode,
     /// NFS mode: the extracted Clonezilla Live zip (it contains live/filesystem.squashfs), exported read-only
     pub live_root: String,
     /// Folder holding the Ubuntu netboot tarball (ubuntu-*-netboot-amd64.tar.gz); `install` unpacks it into the
@@ -123,13 +94,12 @@ impl Default for Config {
             image_dir: "/home/partimag".into(),
             target_disk: "nvme0n1".into(),
             root_mode: RootMode::Tmpfs,
-            cast_mode: CastMode::Unicast,
             live_root: "/srv/nfs/clonezilla".into(),
             netboot_dir: "netboot".into(),
             livesystem_dir: "livesystem".into(),
             tftp_root: "/var/lib/tftpboot".into(),
             web_root: "/var/www/html".into(),
-            hosts_file: "/etc/pxe-installer-hosts.conf".into(),
+            hosts_file: "/etc/dnsmasq.d/pxe-hosts.conf".into(),
             bindings: Vec::new(),
             dry_run: false,
         }
@@ -198,22 +168,6 @@ pub fn is_disk_name(d: &str) -> bool {
     !d.is_empty() && d.len() <= 16 && d.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
-/// LEASE ("24h", "30m", "3600", "infinite") as seconds, for Kea's valid-lifetime (Kea's "infinite" is 2^32-1).
-pub fn lease_seconds(l: &str) -> u64 {
-    const INFINITE: u64 = 4_294_967_295;
-    if l == "infinite" {
-        return INFINITE;
-    }
-    let n: u64 = l.trim_end_matches(|c| matches!(c, 's' | 'm' | 'h' | 'd')).parse().unwrap_or(86_400);
-    let unit = match l.chars().last() {
-        Some('m') => 60,
-        Some('h') => 3_600,
-        Some('d') => 86_400,
-        _ => 1,
-    };
-    n.saturating_mul(unit).min(INFINITE)
-}
-
 fn is_lease(l: &str) -> bool {
     if l == "infinite" {
         return true;
@@ -263,7 +217,8 @@ impl Config {
             "IMAGE_DIR" => self.image_dir = v.trim_end_matches('/').into(),
             "TARGET_DISK" => self.target_disk = v.trim_start_matches("/dev/").into(),
             "ROOT_MODE" => self.root_mode = RootMode::parse(v)?,
-            "CAST_MODE" => self.cast_mode = CastMode::parse(v)?,
+            // setting of an earlier build (a unicast/multicast switch that no longer exists): accepted and ignored
+            "CAST_MODE" => {}
             "LIVE_ROOT" => self.live_root = v.trim_end_matches('/').into(),
             "NETBOOT_DIR" => self.netboot_dir = v.trim_end_matches('/').into(),
             "LIVESYSTEM_DIR" => self.livesystem_dir = v.trim_end_matches('/').into(),
@@ -459,7 +414,6 @@ impl Config {
             format!("IMAGE_DIR={}", self.image_dir),
             format!("TARGET_DISK={}", self.target_disk),
             format!("ROOT_MODE={}", self.root_mode.as_str()),
-            format!("CAST_MODE={}", self.cast_mode.as_str()),
             format!("LIVE_ROOT={}", self.live_root),
             format!("NETBOOT_DIR={}", self.netboot_dir),
             format!("LIVESYSTEM_DIR={}", self.livesystem_dir),
@@ -475,7 +429,7 @@ impl Config {
     /// Non-secret settings the helper commands (ctl / cgi-done) need later.
     pub fn runtime_conf(&self) -> String {
         format!(
-            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\nROOT_MODE={}\nLIVE_ROOT={}\nNETBOOT_DIR={}\nLIVESYSTEM_DIR={}\nIFACE={}\nDHCP_START={}\nDHCP_END={}\nLEASE={}\nUPSTREAM_DNS={}\nONLY_KNOWN_HOSTS={}\nCAST_MODE={}\n",
+            "TFTP_ROOT={}\nWEB_ROOT={}\nIMAGE_DIR={}\nIMAGE_NAME={}\nTARGET_DISK={}\nHOSTS_FILE={}\nSERVER_IP={}\nPREFIX={}\nAUTO_INSTALL={}\nTARGET_HOSTNAME={}\nROOT_MODE={}\nLIVE_ROOT={}\nNETBOOT_DIR={}\nLIVESYSTEM_DIR={}\nIFACE={}\nDHCP_START={}\nDHCP_END={}\nLEASE={}\nUPSTREAM_DNS={}\nONLY_KNOWN_HOSTS={}\n",
             self.tftp_root, self.web_root, self.image_dir, self.image_name, self.target_disk, self.hosts_file,
             self.server_ip, self.prefix,
             u8::from(self.auto_install),
@@ -485,14 +439,13 @@ impl Config {
             // absolute: `pxe-ctl import` later runs from /usr/local/sbin, where "next to the program" is wrong
             resolve_dir(&self.netboot_dir),
             resolve_dir(&self.livesystem_dir),
-            // what `pxe-ctl bind / unbind` need to rewrite the Kea DHCP config later
+            // the DHCP settings of the running server, kept with the other runtime settings
             self.iface,
             self.dhcp_start,
             self.dhcp_end,
             self.lease,
             self.upstream_dns,
-            u8::from(self.only_known_hosts),
-            self.cast_mode.as_str()
+            u8::from(self.only_known_hosts)
         )
     }
 
@@ -592,38 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn cast_mode_parse_and_roundtrip() {
-        assert_eq!(good().cast_mode, CastMode::Unicast); // default
-        assert_eq!(CastMode::parse("Multicast").unwrap(), CastMode::Multicast);
-        assert_eq!(CastMode::parse(" uni ").unwrap(), CastMode::Unicast);
-        assert!(CastMode::parse("broadcast").is_err());
-        let mut c = good();
-        assert!(c.set("CAST_MODE", "bogus").is_err());
-        c.set("CAST_MODE", "multicast").unwrap();
-        let path = std::env::temp_dir().join(format!("pxe-cast-{}.conf", std::process::id()));
-        for text in [c.to_conf(), c.runtime_conf()] {
-            std::fs::write(&path, text).unwrap();
-            let mut d = Config::default();
-            d.load_file(path.to_str().unwrap()).unwrap();
-            assert_eq!(d.cast_mode, CastMode::Multicast);
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn lease_to_seconds() {
-        assert_eq!(lease_seconds("24h"), 86_400);
-        assert_eq!(lease_seconds("30m"), 1_800);
-        assert_eq!(lease_seconds("7d"), 604_800);
-        assert_eq!(lease_seconds("3600"), 3_600);
-        assert_eq!(lease_seconds("90s"), 90);
-        assert_eq!(lease_seconds("infinite"), 4_294_967_295);
-        assert_eq!(lease_seconds("nonsense"), 86_400); // validate() rejects it earlier
-    }
-
-    #[test]
     fn runtime_conf_keeps_the_dhcp_settings() {
-        // `pxe-ctl bind` rewrites the Kea config from /etc/pxe-installer.conf, so it must carry them
+        // the DHCP settings are saved with the other runtime settings (/etc/pxe-installer.conf)
         let mut c = good();
         c.iface = "ens3".into();
         c.lease = "12h".into();

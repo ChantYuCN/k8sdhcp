@@ -386,13 +386,13 @@ fn install_tab() -> gtk::Widget {
     let form_sw = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
     let install_btn = gtk::Button::with_label("Install PXE server");
-    install_btn.set_tooltip_text(Some("Installs Kea (DHCP), tftpd-hpa (TFTP), Apache, NFS, the Clonezilla tools and, for the multicast mode, DRBL + udpcast, and creates the directories; services are left stopped. Nothing is downloaded: the log then lists the netboot and Clonezilla Live files you copy by hand, and where"));
+    install_btn.set_tooltip_text(Some("Installs dnsmasq (DHCP/TFTP), Apache, NFS, the Clonezilla tools and creates the directories; services are left stopped. Nothing is downloaded: the log then lists the netboot and Clonezilla Live files you copy by hand, and where"));
     let start_btn = gtk::Button::with_label("Start PXE server");
     start_btn.add_css_class("suggested-action");
-    start_btn.set_tooltip_text(Some("Writes the network/DHCP/PXE menu/NFS configuration and starts Kea (DHCP) + tftpd-hpa (TFTP) + Apache + NFS"));
+    start_btn.set_tooltip_text(Some("Writes the network/DHCP/PXE menu/NFS configuration and starts dnsmasq (DHCP/TFTP) + Apache + NFS"));
     let stop_btn = gtk::Button::with_label("Stop PXE server");
     stop_btn.add_css_class("destructive-action");
-    stop_btn.set_tooltip_text(Some("Stops Kea (DHCP), tftpd-hpa (TFTP) and Apache so no host can PXE boot"));
+    stop_btn.set_tooltip_text(Some("Stops dnsmasq (DHCP/TFTP) and Apache so no host can PXE boot"));
     let progress = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
     let step_label = gtk::Label::builder().label("Ready.").xalign(0.0).build();
     let (log, log_sw) = log_view();
@@ -422,7 +422,7 @@ fn install_tab() -> gtk::Widget {
         let ui = ui.clone();
         stop_btn.connect_clicked(move |_| {
             ui.log.buffer().set_text("");
-            ui.step_label.set_text("Stopping PXE server (Kea + tftpd-hpa + Apache)...");
+            ui.step_label.set_text("Stopping PXE server (dnsmasq + Apache)...");
             run_ctl(vec!["stop".to_string()], &ui.log);
         });
     }
@@ -441,7 +441,7 @@ fn install_tab() -> gtk::Widget {
         });
     }
     start_btn.connect_clicked(move |_| {
-        run_installer("start", 9.0, "Start finished (see the log). Unicast: boot the targets in UEFI mode, PXE first. Multicast: start the DRBL session, the log shows the command.", form.collect(), &ui)
+        run_installer("start", 9.0, "PXE server running. Boot targets in UEFI mode, PXE first.", form.collect(), &ui)
     });
 
     outer.upcast()
@@ -535,9 +535,6 @@ fn manage_tab() -> gtk::Widget {
         ("Deploy way: show", vec!["mode"]),
         ("Switch to 1: tmpfs", vec!["mode", "tmpfs"]),
         ("Switch to 2: NFS root", vec!["mode", "nfs"]),
-        ("Cast mode: show", vec!["cast"]),
-        ("Switch to unicast", vec!["cast", "unicast"]),
-        ("Switch to multicast", vec!["cast", "multicast"]),
         ("Auto restore: show", vec!["auto"]),
         ("Auto restore: ON", vec!["auto", "on"]),
         ("Auto restore: OFF", vec!["auto", "off"]),
@@ -548,9 +545,6 @@ fn manage_tab() -> gtk::Widget {
         }
         if args[0] == "mode" {
             b.set_tooltip_text(Some("PXE deploy way: tmpfs = Clonezilla Live downloaded into the target's RAM, nfs = mounted from the server. Applies at once to the next PXE boot."));
-        }
-        if args[0] == "cast" {
-            b.set_tooltip_text(Some("unicast = this tool serves the image to every target over NFS (one copy per target). multicast = one stream for all targets, served by DRBL + Clonezilla SE (see drbl-clonezilla-se-multicast-guide.md); Start then sets up only the callbacks and the DRBL pre/post-run scripts (hostname, machine-id, done marker, deploy time) and leaves DHCP/TFTP to DRBL. The mode can only be switched while the PXE server is stopped (Stop button)."));
         }
         if args[0] == "auto" {
             b.set_tooltip_text(Some("ON: a PXE-booted host starts Clonezilla Live and restores the image onto the target disk by itself, without any question (the disk is ERASED). OFF: the PXE menu starts interactive Clonezilla. Applies at once to the next PXE boot."));

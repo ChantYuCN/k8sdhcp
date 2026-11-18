@@ -1,4 +1,4 @@
-//! The `install` command installs Kea (DHCP) + tftpd-hpa (TFTP) + Apache + NFS + the Clonezilla tools, creates the directories and
+//! The `install` command installs dnsmasq (DHCP/TFTP) + Apache + NFS + the Clonezilla tools, creates the directories and
 //! unpacks the Ubuntu netboot tarball (NETBOOT_DIR) and the Clonezilla Live zip (LIVESYSTEM_DIR) into place;
 //! the `start` command writes the PXE configuration and starts the services. Targets boot Clonezilla Live over
 //! PXE and restore a Clonezilla image (served over NFS) onto their disk.
@@ -7,17 +7,16 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{resolve_dir, CastMode, Config, RootMode};
+use crate::config::{resolve_dir, Config, RootMode};
 use crate::ctl;
 use crate::render::{self, CGI_PATH, CGI_SEED_PATH, CTL_WRAPPER_PATH, SELF_PATH};
 use crate::util::*;
 
-/// kea-dhcp4-server (DHCP), tftpd-hpa (TFTP), apache2 and nfs-kernel-server are the PXE services; curl is used
-/// by the checks and unzip unpacks the Clonezilla Live zip; clonezilla/partclone/pigz/zstd let this host
-/// capture the golden image (`ocs-sr`).
-const PACKAGES: [&str; 10] = [
-    "kea-dhcp4-server",
-    "tftpd-hpa",
+/// dnsmasq (DHCP + TFTP), apache2 and nfs-kernel-server are the PXE services; curl is used by the checks and
+/// unzip unpacks the Clonezilla Live zip; clonezilla/partclone/pigz/zstd let this host capture the golden image
+/// (`ocs-sr`).
+const PACKAGES: [&str; 9] = [
+    "dnsmasq",
     "apache2",
     "curl",
     "nfs-kernel-server",
@@ -28,13 +27,8 @@ const PACKAGES: [&str; 10] = [
     "unzip",
 ];
 
-/// Multicast mode (DRBL + Clonezilla SE) needs these. They are installed one by one AFTER the required ones and a
-/// failure is only a warning, so a repository without them (or a DRBL postinst problem) never breaks the unicast
-/// install. `clonezilla` itself may already pull `drbl` in.
-const OPTIONAL_PACKAGES: [&str; 2] = ["drbl", "udpcast"];
-
 /// DHCP, TFTP and HTTP: the services a target needs to PXE boot (NFS is separate: it only serves images).
-const PXE_SERVICES: [&str; 3] = [render::DHCP_SERVICE, render::TFTP_SERVICE, "apache2"];
+const PXE_SERVICES: [&str; 2] = [render::DHCP_SERVICE, "apache2"];
 
 /// Where the admin puts Clonezilla Live: kernel + initrd always under the TFTP root; the live filesystem
 /// depends on the deploy way (ROOT_MODE): under the web root (tmpfs: the target fetches it over HTTP into
@@ -297,9 +291,8 @@ const APT_INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
 const POLICY_RC_D: &str = "/usr/sbin/policy-rc.d";
 
 /// While alive, packages being installed do not start their services (policy-rc.d answers 101 = "denied").
-/// Kea would start with the packaged example config and tftpd-hpa with its default folder, and either can
-/// collide with a dnsmasq an older version of this tool left running on UDP 67/69; a failing service start in
-/// a postinst script would leave the package half-configured. `start` starts everything once configured.
+/// dnsmasq would start with the packaged default config; a failing service start in a postinst script would
+/// leave the package half-configured. `start` starts everything once configured.
 /// An already existing policy-rc.d (e.g. in a container) is left alone.
 struct NoAutoStart(bool);
 impl NoAutoStart {
@@ -328,17 +321,11 @@ fn apt_get(ctx: Ctx, timeout: Duration, tail: &[&str]) -> Result<(), String> {
 /// lock and for the network is bounded, and an interrupted earlier dpkg run is repaired first.
 fn install_packages(ctx: Ctx) -> Result<(), String> {
     let missing = missing_packages();
-    let missing_optional = missing_of(&OPTIONAL_PACKAGES);
-    if missing.is_empty() && missing_optional.is_empty() {
-        println!(
-            "all packages already installed: {}, {}; skipping apt",
-            PACKAGES.join(", "),
-            OPTIONAL_PACKAGES.join(", ")
-        );
+    if missing.is_empty() {
+        println!("all packages already installed: {}; skipping apt", PACKAGES.join(", "));
         return Ok(());
     }
-    let wanted: Vec<&str> = missing.iter().chain(missing_optional.iter()).copied().collect();
-    println!("installing: {} (waits up to 10 min if another apt/dpkg, e.g. unattended-upgrades, is running)", wanted.join(" "));
+    println!("installing: {} (waits up to 10 min if another apt/dpkg, e.g. unattended-upgrades, is running)", missing.join(" "));
     let _no_autostart = NoAutoStart::new(ctx);
 
     // finish a previous, interrupted dpkg run, otherwise every install fails on it
@@ -366,27 +353,13 @@ fn install_packages(ctx: Ctx) -> Result<(), String> {
         warn("apt-get update did not succeed; trying to install from the existing package lists");
     }
 
-    if !missing.is_empty() {
-        let mut tail = vec!["install"];
-        tail.extend(missing.iter().copied());
-        if let Err(first) = apt_get(ctx, APT_INSTALL_TIMEOUT, &tail) {
-            warn(&format!("{first}; repairing and retrying once"));
-            run_soft_timeout(ctx, "dpkg", &DPKG_FIX);
-            let _ = apt_get(ctx, APT_INSTALL_TIMEOUT, &["-f", "install"]);
-            apt_get(ctx, APT_INSTALL_TIMEOUT, &tail)?;
-        }
-    }
-
-    // multicast packages, one by one: a failure is a warning, never an error of the install
-    for pkg in missing_optional {
-        if let Err(e) = apt_get(ctx, APT_INSTALL_TIMEOUT, &["install", pkg]) {
-            warn(&format!(
-                "{pkg} could not be installed ({e}); only the multicast mode needs it - see the multicast guide for DRBL's own repository"
-            ));
-            // do not leave a half-configured package behind: it would block the next apt run
-            run_soft_timeout(ctx, "dpkg", &DPKG_FIX);
-            let _ = apt_get(ctx, APT_INSTALL_TIMEOUT, &["-f", "install"]);
-        }
+    let mut tail = vec!["install"];
+    tail.extend(missing.iter().copied());
+    if let Err(first) = apt_get(ctx, APT_INSTALL_TIMEOUT, &tail) {
+        warn(&format!("{first}; repairing and retrying once"));
+        run_soft_timeout(ctx, "dpkg", &DPKG_FIX);
+        let _ = apt_get(ctx, APT_INSTALL_TIMEOUT, &["-f", "install"]);
+        apt_get(ctx, APT_INSTALL_TIMEOUT, &tail)?;
     }
     Ok(())
 }
@@ -402,41 +375,22 @@ fn pkg_installed(p: &str) -> bool {
     output("dpkg-query", &["-W", "-f=${Status}", p]).is_ok_and(|s| s == "install ok installed")
 }
 
-fn missing_of(list: &[&'static str]) -> Vec<&'static str> {
-    list.iter().copied().filter(|p| !pkg_installed(p)).collect()
-}
-
 fn missing_packages() -> Vec<&'static str> {
-    missing_of(&PACKAGES)
+    PACKAGES.iter().copied().filter(|p| !pkg_installed(p)).collect()
 }
 
 fn check_packages() -> Result<(), String> {
     let missing = missing_packages();
     if missing.is_empty() {
         println!("packages installed: {}", PACKAGES.join(", "));
-        let optional = missing_of(&OPTIONAL_PACKAGES);
-        if optional.is_empty() {
-            println!("multicast packages installed: {}", OPTIONAL_PACKAGES.join(", "));
-        } else {
-            println!("multicast packages NOT installed: {} (only the multicast mode needs them)", optional.join(", "));
-        }
         Ok(())
     } else {
         Err(format!("not installed: {}. Run the Install step first.", missing.join(", ")))
     }
 }
 
-/// `start`: verify the packages, write all configuration, then (re)start Kea + tftpd-hpa + Apache + NFS.
+/// `start`: verify the packages, write all configuration, then (re)start dnsmasq + Apache + NFS.
 pub fn start(c: &Config) -> Result<(), String> {
-    // The cast mode saved by `pxe-ctl cast` decides (it can only change while the PXE server is stopped). A GUI
-    // form or config file carries a mode of its own, which must not override it.
-    let mut with_saved_mode = c.clone();
-    with_saved_mode.cast_mode = Config::load_runtime().cast_mode;
-    let c = &with_saved_mode;
-    if c.cast_mode == CastMode::Multicast {
-        // DHCP/TFTP belong to DRBL + Clonezilla SE: starting Kea here would fight it for the network
-        return start_multicast(c);
-    }
     let ctx = prepare(c, true)?;
 
     if c.only_known_hosts && c.bindings.is_empty() {
@@ -462,7 +416,7 @@ pub fn start(c: &Config) -> Result<(), String> {
          Duplicate-install guard: restored hosts are recorded in {}/<mac>\n\
          \x20 sudo pxe-ctl status | list | reinstall <mac> | done <mac>\n\
          \x20 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>\n\
-         Watch DHCP / TFTP requests with: journalctl -fu kea-dhcp4-server -u tftpd-hpa",
+         Watch DHCP / TFTP requests with: journalctl -fu dnsmasq",
         c.server_ip,
         c.dhcp_start,
         c.dhcp_end,
@@ -493,13 +447,26 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
         }
     }
 
-    // ---- 3. DHCP (Kea) + TFTP (tftpd-hpa). No DNS server is needed: port 53 stays with systemd-resolved ----
-    if ctl::service_active("isc-dhcp-server") {
-        warn("isc-dhcp-server (DRBL's DHCP) is running: it answers DHCP next to Kea. Stop it (pxe-ctl stop) first, or use the multicast cast mode");
+    // ---- 3. DHCP + TFTP + DNS forwarding (dnsmasq); free port 53 (keep systemd-resolved, only drop its stub listener) ----
+    retire_kea(ctx);
+    if ctx.dry || ctl::service_active("systemd-resolved") {
+        step("Disabling systemd-resolved stub listener");
+        write_file(
+            ctx,
+            "/etc/systemd/resolved.conf.d/nostub.conf",
+            "[Resolve]\nDNSStubListener=no\n",
+            0o644,
+            false,
+        )?;
+        run(ctx, "ln", &["-sf", "/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"])?;
+        run(ctx, "systemctl", &["restart", "systemd-resolved"])?;
     }
-    retire_dnsmasq(ctx);
 
-    step("Writing the DHCP (Kea) and TFTP (tftpd-hpa) config");
+    // ---- 4. dnsmasq ----
+    step("Writing dnsmasq config");
+    ensure_global_dnsmasq(ctx)?;
+    mkdir(ctx, "/etc/dnsmasq.d")?;
+    write_file(ctx, render::DNSMASQ_PXE_PATH, &render::dnsmasq_conf(c), 0o644, false)?;
     import_old_bindings(c, ctx);
     if !ctx.dry && !Path::new(&c.hosts_file).exists() {
         write_file(ctx, &c.hosts_file, "", 0o644, false)?;
@@ -511,12 +478,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
             ctl::bind(c, &b.mac, &b.ip, &b.hostname, false)?;
         }
     }
-    keep_original_kea_conf(ctx);
-    // the bindings (hosts file) are Kea's "reservations"
-    let reservations = if ctx.dry { c.bindings.clone() } else { ctl::read_bindings(c) };
-    write_file(ctx, render::KEA_CONF_PATH, &render::kea_conf(c, &reservations), 0o644, false)?;
-    run(ctx, "kea-dhcp4", &["-t", render::KEA_CONF_PATH])?;
-    write_file(ctx, render::TFTPD_DEFAULT_PATH, &render::tftpd_defaults(c), 0o644, false)?;
+    run(ctx, "dnsmasq", &["--test"])?;
 
     // ---- 5. TFTP root skeleton: grub.cfg with the duplicate-install guard + marker dir ----
     step("Writing grub.cfg (duplicate-install guard)");
@@ -546,6 +508,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
         for (port, proto) in [
             ("67", "udp"),
             ("69", "udp"),
+            ("53", "any"),
             ("80", "tcp"),
             ("111", "any"),
             ("2049", "any"),
@@ -579,7 +542,7 @@ fn steps(c: &Config, ctx: Ctx) -> Result<(), String> {
                 .unwrap_or(false)
         });
         if !tftp_ok {
-            warn(&format!("TFTP does not answer at {tftp_url} (is {} running and {} up on {}?)", render::TFTP_SERVICE, c.server_ip, c.iface));
+            warn(&format!("TFTP does not answer at {tftp_url} (is {} running and {} up on {}?)", render::DHCP_SERVICE, c.server_ip, c.iface));
         }
         check_callbacks(c);
         // not errors: the admin copies these by hand after the install (the image is noted by setup_nfs)
@@ -606,7 +569,7 @@ fn install_helpers(c: &Config, ctx: Ctx) -> Result<(), String> {
 }
 
 /// Apache: the Clonezilla web dir, the "done" callback and the per-MAC post-restore script (CGIs). Both the
-/// unicast boot menu and the multicast hooks (see install_drbl_hooks) call them.
+/// boot menu's post-restore step call them.
 fn configure_apache(c: &Config, ctx: Ctx) -> Result<(), String> {
     step("Configuring Apache");
     let cz_web = cz_web_dir(c);
@@ -656,78 +619,6 @@ fn check_callbacks(c: &Config) {
     if !cgi.contains("bad mac") {
         warn("pxe-done CGI not working");
     }
-}
-
-/// Multicast mode: put the two scripts into the folders Clonezilla SE runs on every client before / after the
-/// restore (`drbl-ocs ... -o0 -o1`). They make a multicast deploy do what a unicast one does: deploy start
-/// time, per-MAC hostname, new machine-id and SSH host keys, done marker, deploy time.
-fn install_drbl_hooks(c: &Config, ctx: Ctx) -> Result<(), String> {
-    step("Installing the DRBL pre/post-run scripts (multicast)");
-    let pre = format!("{}/{}", render::DRBL_PRERUN_DIR, render::PRERUN_HOOK_NAME);
-    let post = format!("{}/{}", render::DRBL_POSTRUN_DIR, render::POSTRUN_HOOK_NAME);
-    write_file(ctx, &pre, &render::prerun_hook(c), 0o755, false)?;
-    write_file(ctx, &post, &render::postrun_hook(c), 0o755, false)?;
-    if !ctx.dry && !probe("sh", &["-c", "command -v drblpush >/dev/null"]) {
-        warn("DRBL is not installed yet (apt install drbl): the scripts are in place for when it is");
-    }
-    Ok(())
-}
-
-/// `start` in cast mode multicast. DHCP, TFTP and the multicast session itself belong to DRBL + Clonezilla SE
-/// (this tool does not run them), so this does only what a multicast deploy needs from this tool: the callbacks
-/// (Apache + the pxe-seed / pxe-done CGIs, the done marker folder) and the DRBL pre/post-run scripts that call
-/// them. Kea is switched off so it cannot answer DHCP next to DRBL.
-fn start_multicast(c: &Config) -> Result<(), String> {
-    let ctx = prepare(c, true)?;
-
-    step("Checking the packages are installed");
-    if !ctx.dry {
-        check_packages()?;
-    }
-
-    // DRBL serves DHCP/TFTP: this tool's Kea must not answer too (tftpd-hpa is DRBL's TFTP as well: left alone)
-    step("Switching this tool's DHCP (Kea) off: DRBL serves DHCP in multicast mode");
-    run_soft(ctx, "systemctl", &["disable", "--now", render::DHCP_SERVICE]);
-
-    install_helpers(c, ctx)?;
-    configure_apache(c, ctx)?;
-
-    // the CGIs (www-data) write the start/done records here
-    step("Preparing the done-marker folder");
-    mkdir(ctx, &c.done_dir())?;
-    run(ctx, "chown", &["www-data:www-data", &c.done_dir()])?;
-    if !ctx.dry && !Path::new(&c.hosts_file).exists() {
-        write_file(ctx, &c.hosts_file, "", 0o644, false)?;
-    }
-
-    install_drbl_hooks(c, ctx)?;
-
-    step("Starting Apache");
-    run(ctx, "systemctl", &["enable", "apache2"])?;
-    run(ctx, "systemctl", &["restart", "apache2"])?;
-    if ctx.dry || probe("sh", &["-c", "command -v ufw >/dev/null && ufw status | grep -q 'Status: active'"]) {
-        run_soft(ctx, "ufw", &["allow", "in", "on", c.iface.as_str(), "to", "any", "port", "80", "proto", "tcp"]);
-    }
-
-    step("Checks");
-    if !ctx.dry {
-        println!("apache2: {}", if ctl::service_active("apache2") { "active" } else { "NOT ACTIVE" });
-        check_callbacks(c);
-    }
-
-    println!(
-        "\nMulticast mode: the callbacks ({}/cgi-bin/pxe-seed, pxe-done) and the DRBL pre/post-run scripts are in place.\n\
-         DHCP, TFTP and the multicast session are DRBL + Clonezilla SE (see drbl-clonezilla-se-multicast-guide.md):\n\
-         \x20 sudo drblpush -i            (once; Clonezilla box mode, UEFI, the provisioning NIC {})\n\
-         \x20 sudo drbl-ocs -b -g auto -e1 auto -e2 -x -r -j2 -sc0 -p reboot -o0 -o1 \\\n\
-         \x20   --clients-to-wait <N> --max-time-to-wait 600 -l en_US.UTF-8 \\\n\
-         \x20   startdisk multicast_restoredisk {} {}\n\
-         The disk name must be {} on every client: the post-restore script looks for the system there.\n\
-         Hostnames come from the MAC bindings (sudo pxe-ctl bind <mac> <ip> <hostname>); a MAC without one gets {}.\n\
-         Check a deploy on this server: sudo pxe-ctl times | status | list",
-        c.server_ip, c.iface, c.image_name, c.target_disk, c.target_disk, c.target_hostname
-    );
-    Ok(())
 }
 
 const NFS_MOUNTD_PORT: &str = "20048";
@@ -781,54 +672,81 @@ fn drop_old_iso_mount(ctx: Ctx) -> Result<(), String> {
     Ok(())
 }
 
-/// Where the dnsmasq versions of this tool kept their bindings and PXE settings.
-const OLD_HOSTS_FILES: [&str; 2] = ["/etc/dnsmasq.d/pxe-hosts.conf", "/etc/kea/pxe-hosts.conf"];
-const OLD_DNSMASQ_PXE_CONF: &str = "/etc/dnsmasq.d/pxe.conf";
+/// Where the Kea build of this tool kept the MAC bindings (no `dhcp-host=` prefix: dnsmasq cannot load that as is).
+const OLD_HOSTS_FILES: [&str; 2] = ["/etc/pxe-installer-hosts.conf", "/etc/kea/pxe-hosts.conf"];
 
-/// Older versions of this tool served DHCP and TFTP with dnsmasq. It would fight Kea and tftpd-hpa for UDP
-/// 67/69, so stop and disable it. Only when our old config is there: a dnsmasq the admin runs for other
-/// purposes is left alone. The package and its files stay.
-fn retire_dnsmasq(ctx: Ctx) {
+/// The Kea + tftpd-hpa build of this tool leaves its services behind; they would fight dnsmasq for UDP 67/69. Stop
+/// and disable them, but only when their config is ours (a Kea or tftpd-hpa the admin runs for other purposes is
+/// left alone). The packages and files stay.
+fn retire_kea(ctx: Ctx) {
     if ctx.dry {
-        println!("[dry-run] stop + disable dnsmasq if an older version of this tool left it serving DHCP/TFTP");
+        println!("[dry-run] stop + disable Kea / tftpd-hpa if the Kea build of this tool left them running");
         return;
     }
-    if Path::new(OLD_DNSMASQ_PXE_CONF).exists() && probe("systemctl", &["cat", "dnsmasq.service"]) {
-        step("Retiring dnsmasq (DHCP/TFTP are served by Kea and tftpd-hpa now)");
-        run_soft(ctx, "systemctl", &["disable", "--now", "dnsmasq"]);
+    let ours = |path: &str, mark: &str| fs::read_to_string(path).is_ok_and(|t| t.starts_with(mark));
+    if ours("/etc/kea/kea-dhcp4.conf", "// generated by pxe-installer") && probe("systemctl", &["cat", "kea-dhcp4-server.service"]) {
+        step("Retiring Kea (DHCP and TFTP are served by dnsmasq again)");
+        run_soft(ctx, "systemctl", &["disable", "--now", "kea-dhcp4-server"]);
+    }
+    if ours("/etc/default/tftpd-hpa", "# generated by pxe-installer") && probe("systemctl", &["cat", "tftpd-hpa.service"]) {
+        run_soft(ctx, "systemctl", &["disable", "--now", "tftpd-hpa"]);
     }
 }
 
-/// First run on a server that was set up with dnsmasq: take over its MAC -> IP bindings (the line format
-/// is still understood, see ctl::read_hosts).
+/// dnsmasq loads the hosts file as a config file, so every line needs the `dhcp-host=` prefix. An existing file is
+/// written back in that format (the Kea build wrote plain `mac,ip,name` lines); when there is none yet, the
+/// bindings of the Kea build are taken over.
 fn import_old_bindings(c: &Config, ctx: Ctx) {
-    if ctx.dry || Path::new(&c.hosts_file).exists() {
+    if ctx.dry {
+        return;
+    }
+    if Path::new(&c.hosts_file).exists() {
+        if let Err(e) = ctl::import_bindings_from(c, &c.hosts_file) {
+            warn(&format!("could not rewrite {}: {e}", c.hosts_file));
+        }
         return;
     }
     let Some(old) = OLD_HOSTS_FILES.iter().find(|p| Path::new(p).exists()) else { return };
-    let copied = fs::read_to_string(old).map_err(|e| e.to_string()).and_then(|text| {
-        if let Some(parent) = Path::new(&c.hosts_file).parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        fs::write(&c.hosts_file, text).map_err(|e| e.to_string())
-    });
-    match copied {
-        Ok(()) => println!("imported the MAC bindings of an earlier version from {old}"),
+    match ctl::import_bindings_from(c, old) {
+        Ok(()) => println!("imported the MAC bindings of the Kea build from {old}"),
         Err(e) => warn(&format!("could not import {old}: {e}")),
     }
 }
 
-/// The Kea package ships its own /etc/kea/kea-dhcp4.conf; keep a copy of it once before ours replaces it.
-fn keep_original_kea_conf(ctx: Ctx) {
-    if ctx.dry {
-        return;
-    }
-    let keep = format!("{}.pxe-orig", render::KEA_CONF_PATH);
-    if let Ok(text) = fs::read_to_string(render::KEA_CONF_PATH) {
-        if !text.starts_with(render::GENERATED_MARK) && !Path::new(&keep).exists() {
-            let _ = fs::write(&keep, text);
+const DNSMASQ_GLOBAL: &str = "/etc/dnsmasq.conf";
+const CONF_DIR_LINE: &str = "conf-dir=/etc/dnsmasq.d/,*.conf";
+
+/// /etc/dnsmasq.conf stays the global config; the PXE settings live in /etc/dnsmasq.d/pxe.conf.
+/// This only makes sure the global file loads /etc/dnsmasq.d, and undoes older versions of this
+/// installer that replaced the whole file.
+fn ensure_global_dnsmasq(ctx: Ctx) -> Result<(), String> {
+    let bak = format!("{DNSMASQ_GLOBAL}.bak");
+    let current = if ctx.dry { None } else { fs::read_to_string(DNSMASQ_GLOBAL).ok() };
+
+    if current.as_deref().is_some_and(|t| t.starts_with("# generated by pxe-installer")) {
+        // old layout: our generated file was the global one, the original is in .bak
+        if Path::new(&bak).exists() {
+            fs::rename(&bak, DNSMASQ_GLOBAL).map_err(|e| format!("restore {bak}: {e}"))?;
+        } else {
+            write_file(ctx, DNSMASQ_GLOBAL, &format!("{CONF_DIR_LINE}\n"), 0o644, false)?;
         }
     }
+
+    let text = if ctx.dry { String::new() } else { fs::read_to_string(DNSMASQ_GLOBAL).unwrap_or_default() };
+    let loads_dir = text.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("conf-dir=") && l.contains("/etc/dnsmasq.d")
+    });
+    if ctx.dry || !loads_dir {
+        let mut body = text;
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(CONF_DIR_LINE);
+        body.push('\n');
+        write_file(ctx, DNSMASQ_GLOBAL, &body, 0o644, false)?;
+    }
+    Ok(())
 }
 
 fn set_mode_soft(ctx: Ctx, path: &str, mode: u32) {

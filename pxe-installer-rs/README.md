@@ -1,6 +1,6 @@
 # pxe-installer (Rust)
 
-One static binary that installs and manages a **UEFI PXE server** (Kea DHCP + tftpd-hpa TFTP + Apache + NFS)
+One static binary that installs and manages a **UEFI PXE server** (dnsmasq DHCP/TFTP + Apache + NFS)
 that **deploys a Clonezilla disk image** to target hosts. Targets PXE boot Clonezilla Live, restore the
 image onto their disk, get their own hostname / machine-id / SSH host keys, and report back. Hosts that
 already finished are skipped; MAC -> IP bindings supported. The CLI is std-only; the optional GUI uses the
@@ -31,10 +31,8 @@ Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) a
 `target/release/pxe-installer-gui` (GUI; keep it in the same folder as `pxe-installer`).
 
 ## What `install` does, and the files it unpacks
-`install` installs the packages (kea-dhcp4-server, tftpd-hpa, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
-`clonezilla partclone pigz zstd`) and, for the multicast mode, `drbl` and `udpcast` (installed last, one by one;
-if one cannot be installed it is only a warning, the unicast install is not affected), creates the directories
-and leaves the services stopped. **It downloads nothing.** As its **last step** it unpacks the two files you put on the server beforehand:
+`install` installs the packages (dnsmasq, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
+`clonezilla partclone pigz zstd`), creates the directories and leaves the services stopped. **It downloads nothing.** As its **last step** it unpacks the two files you put on the server beforehand:
 
 | Put it in (setting) | `install` then does |
 | --- | --- |
@@ -153,9 +151,8 @@ sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
 sudo pxe-ctl grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | stop
 sudo pxe-ctl auto [on|off]                  # on = PXE-booted hosts restore by themselves, no question; off = interactive menu
-sudo pxe-ctl cast [unicast|multicast]       # how the image reaches the targets; switchable only while the PXE server is stopped
-  # bindings are stored as `mac,ip,name` lines in /etc/pxe-installer-hosts.conf (HOSTS_FILE; outside /etc/kea so the CGI, which runs as www-data, can read it) and become Kea reservations:
-  # bind/unbind regenerate /etc/kea/kea-dhcp4.conf, check it with `kea-dhcp4 -t` and reload Kea (leases are kept)
+  # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
+  # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
 Flags override the config file (`--iface`, `--server-ip`, `--host mac,ip,name`, `--static-ip`,
 `--image-name`, `--image-dir`, `--target-disk` ...); see `pxe-installer --help`. Settings of older
@@ -195,46 +192,25 @@ the clock; a deploy without a recorded start (for example after an upgrade, with
 with empty start and elapsed. Re-run `start` (or `pxe-ctl grub`) once so the new `grub.cfg` is written.
 
 ## What `start` does
-(optional netplan static IP) -> `/etc/kea/kea-dhcp4.conf` (address pool, UEFI boot file, MAC bindings as
-reservations; the packaged file is kept once as `kea-dhcp4.conf.pxe-orig`) and `/etc/default/tftpd-hpa` (TFTP
-root, read-only) -> `grub.cfg` (Clonezilla entries)
+(optional netplan static IP) -> free port 53 -> `/etc/dnsmasq.d/pxe.conf` (global `/etc/dnsmasq.conf` is
+kept, only ensured to load `conf-dir=/etc/dnsmasq.d`) + MAC bindings -> `grub.cfg` (Clonezilla entries)
 -> copies itself to `/usr/local/sbin/pxe-installer`, writes the `pxe-ctl` wrapper -> CGIs and Apache conf ->
 NFS export of `IMAGE_DIR` (and `LIVE_ROOT` in nfs mode; read-only, PXE subnet) -> start services, ufw rules,
 checks.
 
-## DHCP and TFTP: Kea + tftpd-hpa
-DHCP is served by **Kea** (`kea-dhcp4-server`) and TFTP by **tftpd-hpa**; there is no DNS server (the clients
-get `UPSTREAM_DNS` in the DHCP answer, so port 53 and `systemd-resolved` are left alone). Everything Kea
-needs is generated from the settings: the pool `DHCP_START`-`DHCP_END` (none with `ONLY_KNOWN_HOSTS`: then only
-hosts with a binding get an address), `LEASE`, and a UEFI x64 client class that hands out `bootx64.efi` with
-the server as TFTP server. Leases are in `/var/lib/kea/kea-leases4.csv` (what `pxe-ctl status` reads).
-tftpd-hpa listens on UDP 69 of all interfaces, read-only, chrooted into the TFTP root (`--secure`).
-Watch it with `journalctl -fu kea-dhcp4-server -u tftpd-hpa`.
+## DHCP and TFTP: dnsmasq
+DHCP, TFTP and DNS forwarding are served by **dnsmasq** (one service, `dnsmasq`). The PXE settings are generated
+into `/etc/dnsmasq.d/pxe.conf` (`/etc/dnsmasq.conf` stays the global file and only has to load `conf-dir`): the
+pool `DHCP_START`-`DHCP_END`, `LEASE`, the router/DNS options, `dhcp-ignore=tag:!known` with `ONLY_KNOWN_HOSTS`,
+the TFTP root, and a UEFI x64 match (option 93 = 7 or 9) that hands out `bootx64.efi`. The MAC bindings are in
+the hosts file (`/etc/dnsmasq.d/pxe-hosts.conf`) as `dhcp-host=mac,ip[,name]` lines; `pxe-ctl bind / unbind`
+rewrite it and restart dnsmasq (only when it is running; leases are kept in `/var/lib/misc/dnsmasq.leases`, what
+`pxe-ctl status` reads). Watch requests with `journalctl -fu dnsmasq`.
 
-Upgrading from the dnsmasq version: run **Install** and **Start** again. `start` stops and disables the old
-dnsmasq service (only if its `/etc/dnsmasq.d/pxe.conf` is there; the package and files stay), imports the MAC
-bindings from `/etc/dnsmasq.d/pxe-hosts.conf` (or `/etc/kea/pxe-hosts.conf` of an earlier Kea build), and writes the Kea config. Do not run another DHCP or TFTP
-server (for example DRBL) on the same network.
-
-## Cast mode: unicast or multicast
-`pxe-ctl cast [unicast|multicast]` (Manage tab: **Cast mode: show / Switch to unicast / Switch to multicast**)
-selects how the image reaches the targets. It can only be switched **while the PXE server is stopped**
-(`pxe-ctl stop` / the Stop button); otherwise it lists the services that are still running and changes nothing.
-
-| Mode | Served by | Start button |
-| --- | --- | --- |
-| `unicast` (default) | this tool: Kea + tftpd-hpa + Apache + NFS, every target pulls its own copy | works as described above |
-| `multicast` | **DRBL + Clonezilla SE**, one stream for all targets: follow `drbl-clonezilla-se-multicast-guide.md` | sets up only the callbacks (Apache CGIs, done-marker folder) and the DRBL pre/post-run scripts, switches Kea off, and prints the `drbl-ocs` command; it never starts Kea or this tool's TFTP |
-
-This tool does **not** run DRBL or the multicast session for you (`drblpush`, `drbl-ocs`): it keeps the two
-stacks apart (switching to multicast also disables the Kea service so it cannot come back at boot) and gives a
-multicast deploy what a unicast one has: **Start** in multicast mode writes two scripts that Clonezilla SE runs on
-every client (`/usr/share/drbl/prerun/ocs/pxe-installer-start.sh`, `/usr/share/drbl/postrun/ocs/pxe-installer-post.sh`;
-add `-o0 -o1` to the `drbl-ocs` command). They record the deploy start, then fetch and run the same per-MAC
-`post.sh` as unicast: hostname bound to the MAC, new machine-id, new SSH host keys, done marker, deploy time
-(`pxe-ctl times`). Not available in multicast mode: the skip-PXE-when-done guard and `AUTO_INSTALL`. `pxe-ctl stop` also
-stops DRBL's DHCP server (`isc-dhcp-server`) so the mode can be switched back. The mode is saved in
-`/etc/pxe-installer.conf` (`CAST_MODE`) and shown by `pxe-ctl status`.
+Coming from the Kea + tftpd-hpa build: run **Install** and **Start** again. `start` stops and disables Kea and
+tftpd-hpa (only when their config is the one this tool generated; the packages and files stay), and takes over
+the MAC bindings of that build (`/etc/pxe-installer-hosts.conf` or `/etc/kea/pxe-hosts.conf`), rewriting them with
+the `dhcp-host=` prefix dnsmasq needs. Do not run another DHCP or TFTP server on the same network.
 
 ## Security
 PXE, TFTP, NFS and the callbacks are unauthenticated: use an isolated provisioning network with no other
@@ -246,8 +222,8 @@ protection against a spoofed MAC.
 src/lib.rs       shared library (used by both binaries)
 src/gui.rs      GTK 4 app (feature `gui`)
 src/config.rs   settings, config-file/flag parsing, validation
-src/render.rs   templates for the Kea config, tftpd-hpa defaults, grub.cfg (Clonezilla), post.sh, netplan, apache conf
-src/install.rs  the install steps: packages, Kea, tftpd-hpa, Apache, NFS export, services (honours --dry-run)
+src/render.rs   templates for dnsmasq.conf, grub.cfg (Clonezilla), post.sh, netplan, apache conf
+src/install.rs  the install steps: packages, dnsmasq, Apache, NFS export, services (honours --dry-run)
 src/ctl.rs      pxe-ctl commands, status, CGI callbacks (pxe-done, pxe-seed)
 src/util.rs     command/file helpers
 ```

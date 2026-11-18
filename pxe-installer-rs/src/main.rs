@@ -1,19 +1,19 @@
 //! pxe-installer: one static binary that installs and manages a UEFI PXE server
-//! (Kea for DHCP, tftpd-hpa for TFTP, Apache, NFS) that deploys a Clonezilla image to targets, with per-host
+//! (dnsmasq for DHCP/TFTP, Apache, NFS) that deploys a Clonezilla image to targets, with per-host
 //! install tracking.
 use pxe_installer::{config, ctl, install};
 
 use std::process::exit;
 
 const USAGE: &str = "\
-pxe-installer - UEFI PXE server that deploys a Clonezilla image (Kea + tftpd-hpa + Apache + NFS)
+pxe-installer - UEFI PXE server that deploys a Clonezilla image (dnsmasq + Apache + NFS)
 
 USAGE
   pxe-installer install [--config FILE] [--dry-run] [options]   install packages (incl. clonezilla, partclone, pigz, zstd)
                                                                  + create directories, services left stopped; then it lists
                                                                  the netboot / Clonezilla Live files YOU copy by hand and where
   pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
-  pxe-installer ctl list | status | times | stop | grub | import | auto [on|off] | cast [unicast|multicast] | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
+  pxe-installer ctl list | status | times | stop | grub | import | auto [on|off] | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
                     | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
                     (clone = interactive fsck of each partition, then ocs-sr, on this terminal;
