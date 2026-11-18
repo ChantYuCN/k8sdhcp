@@ -5,7 +5,7 @@ use gtk4 as gtk;
 
 use gtk::glib;
 use gtk::prelude::*;
-use pxe_installer::config::{Config, RootMode};
+use pxe_installer::config::Config;
 use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -223,8 +223,6 @@ struct Form {
     t_host: gtk::Entry,
     image: gtk::Entry,
     disk: gtk::Entry,
-    /// deploy way: this radio button selects NFS, its partner selects tmpfs
-    root_nfs: gtk::CheckButton,
 }
 
 impl Form {
@@ -242,7 +240,8 @@ impl Form {
         c.target_hostname = text_of(&self.t_host).trim().to_string();
         c.image_name = text_of(&self.image).trim().to_string();
         c.target_disk = text_of(&self.disk).trim().trim_start_matches("/dev/").to_string();
-        c.root_mode = if self.root_nfs.is_active() { RootMode::Nfs } else { RootMode::Tmpfs };
+        // the deploy way (tmpfs / NFS) is switched on the Manage tab; Start must keep what is saved there
+        c.root_mode = Config::load_runtime().root_mode;
 
         let errs = c.validate();
         if !errs.is_empty() {
@@ -359,26 +358,13 @@ fn install_tab() -> gtk::Widget {
     grid_row(&tgt, 0, "Default hostname (no binding)", &t_host);
     grid_row(&tgt, 1, "Clonezilla image name", &image);
     grid_row(&tgt, 2, "Target disk (/dev/...)", &disk);
-    // PXE deploy way switch: two radio buttons (a group); tmpfs is the default
-    let root_tmpfs = gtk::CheckButton::with_label(
-        "Deploy way 1: tmpfs - Clonezilla Live is downloaded over HTTP into the target's RAM (needs about 4 GB RAM)",
-    );
-    let root_nfs = gtk::CheckButton::with_label(
-        "Deploy way 2: NFS - the target mounts Clonezilla Live from the server over NFS (diskless root, no RAM copy)",
-    );
-    root_nfs.set_group(Some(&root_tmpfs));
-    root_tmpfs.set_active(d.root_mode == RootMode::Tmpfs);
-    root_nfs.set_active(d.root_mode == RootMode::Nfs);
-    root_nfs.set_tooltip_text(Some("Needs the whole Clonezilla Live zip extracted into /srv/nfs/clonezilla (it must contain live/filesystem.squashfs)"));
-    tgt.attach(&root_tmpfs, 0, 3, 2, 1);
-    tgt.attach(&root_nfs, 0, 4, 2, 1);
     let warn = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
         .use_markup(true)
         .label("<b>Warning:</b> hosts that PXE boot have the target disk <b>wiped</b> and restored from the image unless already installed (or marked done).")
         .build();
-    tgt.attach(&warn, 0, 5, 2, 1);
+    tgt.attach(&warn, 0, 3, 2, 1);
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     body.append(&framed("Network / DHCP", &net));
@@ -413,7 +399,7 @@ fn install_tab() -> gtk::Widget {
 
     let form = Form {
         iface, server_ip, prefix, dhcp_start, dhcp_end, lease, dns, static_ip, only_known,
-        t_host, image, disk, root_nfs,
+        t_host, image, disk,
     };
 
     let ui = Rc::new(RunUi { log, step_label, progress, buttons: vec![install_btn.clone(), start_btn.clone()] });
@@ -535,9 +521,6 @@ fn manage_tab() -> gtk::Widget {
         ("Deploy way: show", vec!["mode"]),
         ("Switch to 1: tmpfs", vec!["mode", "tmpfs"]),
         ("Switch to 2: NFS root", vec!["mode", "nfs"]),
-        ("Auto restore: show", vec!["auto"]),
-        ("Auto restore: ON", vec!["auto", "on"]),
-        ("Auto restore: OFF", vec!["auto", "off"]),
     ] {
         let b = gtk::Button::with_label(label);
         if args[0] == "nfs" {
@@ -545,9 +528,6 @@ fn manage_tab() -> gtk::Widget {
         }
         if args[0] == "mode" {
             b.set_tooltip_text(Some("PXE deploy way: tmpfs = Clonezilla Live downloaded into the target's RAM, nfs = mounted from the server. Applies at once to the next PXE boot."));
-        }
-        if args[0] == "auto" {
-            b.set_tooltip_text(Some("ON: a PXE-booted host starts Clonezilla Live and restores the image onto the target disk by itself, without any question (the disk is ERASED). OFF: the PXE menu starts interactive Clonezilla. Applies at once to the next PXE boot."));
         }
         let log = log.clone();
         b.connect_clicked(move |_| run_ctl(args.iter().map(|s| s.to_string()).collect(), &log));

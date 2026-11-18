@@ -13,7 +13,7 @@ USAGE
                                                                  + create directories, services left stopped; then it lists
                                                                  the netboot / Clonezilla Live files YOU copy by hand and where
   pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
-  pxe-installer ctl list | status | times | stop | grub | import | auto [on|off] | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
+  pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force]
                     | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
                     (clone = interactive fsck of each partition, then ocs-sr, on this terminal;

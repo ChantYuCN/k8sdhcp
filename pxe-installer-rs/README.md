@@ -131,7 +131,7 @@ look at `cat /boot.log` in the initramfs and fall back to `tmpfs`.
 ```
 ./target/release/pxe-installer-gui
 ```
-Install tab: network/DHCP, default hostname, image name, target disk, deploy way (1 tmpfs / 2 NFS) ->
+Install tab: network/DHCP, default hostname, image name, target disk (the deploy way, tmpfs or NFS, is switched on the Manage tab and Start keeps it) ->
 **Install** (packages, directories, then the netboot tarball in `netboot/` and the Clonezilla Live zip
 in `livesystem/` next to the program are unpacked; services stopped) -> **Start**. It validates with the same code as the CLI, writes a mode-600 temp config, runs
 `pxe-installer start --config ...` as root (directly, via passwordless `sudo -n`, or else a pkexec prompt)
@@ -150,7 +150,6 @@ sudo pxe-ctl times                           # deploy time of every MAC (all run
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
 sudo pxe-ctl grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | stop
-sudo pxe-ctl auto [on|off]                  # on = PXE-booted hosts restore by themselves, no question; off = interactive menu
   # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```

@@ -349,33 +349,6 @@ fn switch_mode(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `ctl auto [on|off]` - show or switch AUTO_INSTALL. on = a PXE-booted host starts Clonezilla Live and restores
-/// the image onto TARGET_DISK by itself, no menu choice and no question (it ERASES the disk); off = the menu
-/// starts interactive Clonezilla and the restore entry has to be selected by hand. Applied at once to the next
-/// PXE boot (grub.cfg is rewritten); hosts that are already booted into Clonezilla are not affected.
-fn switch_auto(mut c: Config, wanted: Option<&str>) -> Result<(), String> {
-    let describe = |on: bool| {
-        if on {
-            "ON: PXE-booted hosts restore the image onto /dev/{disk} by themselves (the disk is ERASED, nothing is asked)"
-        } else {
-            "OFF: the PXE menu starts interactive Clonezilla; the restore entry must be selected by hand"
-        }
-    };
-    if let Some(w) = wanted {
-        let on = match w {
-            "on" | "1" | "yes" | "true" => true,
-            "off" | "0" | "no" | "false" => false,
-            other => return Err(format!("'{other}' is not on or off")),
-        };
-        c.auto_install = on;
-        let ctx = Ctx { dry: false };
-        write_file(ctx, crate::config::RUNTIME_CONF, &c.runtime_conf(), 0o644, false)?;
-        write_grub(&c, ctx)?;
-    }
-    println!("Automatic restore is {}", describe(c.auto_install).replace("{disk}", &c.target_disk));
-    Ok(())
-}
-
 /// `ocs-sr` saves images under this folder (Clonezilla's default `ocsroot`), so IMAGE_DIR has to be it.
 const OCS_ROOT: &str = "/home/partimag";
 /// Only one capture at a time (the GUI button could be clicked twice). /run is a tmpfs: gone after a reboot.
@@ -657,7 +630,6 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
-        Some("auto") => switch_auto(c, args.get(1).map(|s| s.as_str())),
         Some("clone") => clone_image(c, &args[1..]),
         Some("binds") => {
             for l in read_hosts(&c) {
@@ -672,7 +644,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | auto [on|off] | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
