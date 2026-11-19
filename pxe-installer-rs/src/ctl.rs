@@ -575,6 +575,281 @@ fn clone_image(mut c: Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ multicast restore
+//
+// One stream for all targets instead of one copy per target. The targets boot the "Multicast restore" menu entry and
+// run Clonezilla's own client script (`ocs-live-get-img <server>`): it downloads `ocs-client-run.conf` and
+// `img-wo-fs.tar.xz` (the image folder without the data files) from this server's web root, then runs
+// `ocs-sr ... multicast_restoredisk`, which receives each partition with `udp-receiver | partclone`. This server only
+// has to publish those two files and send each partition with `udp-sender`, in the order of the image's `parts` file,
+// on UDP port 2232, 2234, ... (+2 per partition), exactly as Clonezilla's own `ocs-live-feed-img` does. That script
+// is NOT used here: it stops dnsmasq and rewrites the PXE configuration.
+
+/// Clonezilla's multicast defaults (/etc/drbl/drbl-ocs.conf): the all-hosts group, TTL 1 (stays in the LAN), the first
+/// UDP port, and the seconds the later partitions wait for the clients (PART_PREPARE_TIME).
+const MCAST_ADDR: &str = "224.0.0.1";
+const MCAST_PORT: u32 = 2232;
+const MCAST_PART_WAIT: u32 = 30;
+/// Only one session at a time; it holds the PID of `pxe-ctl multicast` (a stale file of a dead PID is ignored).
+const MCAST_LOCK: &str = "/run/pxe-installer-multicast.lock";
+const CLIENT_CONF: &str = "ocs-client-run.conf";
+const CLIENT_PSEUDO: &str = "img-wo-fs.tar.xz";
+/// Restore options the targets run with (the same as the unicast restore, `-batch` comes from `--batch`).
+const MCAST_OCS_OPT: &str = "-g auto -e1 auto -e2 -r -j2 -k0 -p true -scr";
+
+/// Arguments of `ctl multicast`.
+#[derive(Debug, PartialEq)]
+struct McastArgs {
+    clients: Option<u32>,
+    wait: u32,
+    image: Option<String>,
+    stop: bool,
+}
+
+/// `--clients N` (targets to wait for), `--wait SECS` (how long the first partition waits, default 600),
+/// `--image NAME` (default IMAGE_NAME), `--stop` (clean up a session that was interrupted).
+fn parse_multicast_args(args: &[String]) -> Result<McastArgs, String> {
+    let mut a = McastArgs { clients: None, wait: 600, image: None, stop: false };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--stop" => a.stop = true,
+            "--clients" => {
+                let n: u32 = it.next().ok_or("--clients needs a number")?.parse().map_err(|_| "--clients must be a number")?;
+                if n == 0 {
+                    return Err("--clients must be at least 1".into());
+                }
+                a.clients = Some(n);
+            }
+            "--wait" => {
+                a.wait = it.next().ok_or("--wait needs a number of seconds")?.parse().map_err(|_| "--wait must be a number of seconds")?;
+            }
+            "--image" => {
+                let name = it.next().ok_or("--image needs an image name")?;
+                if !is_image_name(name) {
+                    return Err(format!("'{name}' is not a valid image name"));
+                }
+                a.image = Some(name.clone());
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    Ok(a)
+}
+
+/// Image data files (partclone / ntfsclone / dd). The clients get only EMPTY placeholders of them in the metadata
+/// tarball; their content travels over multicast.
+fn is_image_data_file(name: &str) -> bool {
+    name.contains("-ptcl-img.") || name.contains(".ntfs-img.") || name.contains(".dd-img.")
+}
+
+/// The partclone image files of every partition, in the order of the image's `parts` file; the files of one
+/// partition sorted (a split image is `.aa`, `.ab`, ...). Anything this cannot send is an error.
+fn multicast_parts(image_dir: &Path) -> Result<Vec<(String, Vec<std::path::PathBuf>)>, String> {
+    if image_dir.join("lvm_logv.list").exists() {
+        return Err("this image has LVM volumes: multicast restore of LVM images is not supported here".into());
+    }
+    let parts_file = image_dir.join("parts");
+    let parts = fs::read_to_string(&parts_file).map_err(|e| format!("cannot read {}: {e}", parts_file.display()))?;
+    let names: Vec<String> = fs::read_dir(image_dir)
+        .map_err(|e| format!("cannot read {}: {e}", image_dir.display()))?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    let mut out = Vec::new();
+    for part in parts.split_whitespace() {
+        if !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+            return Err(format!("unexpected partition name '{part}' in {}", parts_file.display()));
+        }
+        let prefix = format!("{part}.");
+        let mut files: Vec<&String> = names.iter().filter(|n| n.starts_with(&prefix) && n.contains("-ptcl-img.")).collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(format!(
+                "no partclone image file for partition {part} in {} (only partclone images, *-ptcl-img.*, are supported)",
+                image_dir.display()
+            ));
+        }
+        out.push((part.to_string(), files.into_iter().map(|f| image_dir.join(f)).collect()));
+    }
+    if out.is_empty() {
+        return Err(format!("{} lists no partitions", parts_file.display()));
+    }
+    Ok(out)
+}
+
+/// `udp-sender` options for partition number `n` (0 = the first one; each partition is on its own port).
+fn udp_sender_args(iface: &str, clients: u32, first_wait: u32, n: u32) -> Vec<String> {
+    let max_wait = if n == 0 { first_wait } else { MCAST_PART_WAIT };
+    vec![
+        "--min-clients".to_string(),
+        clients.to_string(),
+        "--max-wait".into(),
+        max_wait.to_string(),
+        "--interface".into(),
+        iface.to_string(),
+        "--nokbd".into(),
+        "--mcast-all-addr".into(),
+        MCAST_ADDR.into(),
+        "--portbase".into(),
+        (MCAST_PORT + 2 * n).to_string(),
+        "--ttl".into(),
+        "1".into(),
+    ]
+}
+
+/// What the targets download as `ocs-client-run.conf` (the file is sourced by a root shell on the target: the
+/// image and disk names are validated before they get here).
+fn client_run_conf(image: &str, disk: &str) -> String {
+    format!(
+        "pseudo_img=\"{CLIENT_PSEUDO}\"\nimg_prefix=\"{image}\"\n\
+         ocs_sr_opt=\"--ocsroot /tmp/ -l en_US.UTF-8 --batch {MCAST_OCS_OPT} --mcast-port {MCAST_PORT} multicast_restoredisk\"\n\
+         ocs_restore_dev=\"{disk}\"\n"
+    )
+}
+
+/// `img-wo-fs.tar.xz`: the image folder with every data file replaced by an empty placeholder (what the targets
+/// need to know about the image: partition table, parts list, file system list ...).
+fn pack_pseudo_image(image_dir: &Path, out: &Path) -> Result<(), String> {
+    let tmp = std::path::PathBuf::from(format!("/var/tmp/pxe-installer-pseudo-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).map_err(|e| format!("mkdir {}: {e}", tmp.display()))?;
+    let result = (|| -> Result<(), String> {
+        for e in fs::read_dir(image_dir).map_err(|e| format!("cannot read {}: {e}", image_dir.display()))?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if e.path().is_dir() {
+                continue;
+            }
+            if is_image_data_file(&name) {
+                fs::write(tmp.join(&name), b"").map_err(|e| format!("write placeholder {name}: {e}"))?;
+            } else {
+                fs::copy(e.path(), tmp.join(&name)).map_err(|e| format!("copy {name}: {e}"))?;
+            }
+        }
+        let status = std::process::Command::new("tar")
+            .arg("-cJf")
+            .arg(out)
+            .arg("-C")
+            .arg(&tmp)
+            .arg(".")
+            .status()
+            .map_err(|e| format!("cannot run tar: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tar failed ({status}); is xz-utils installed?"))
+        }
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Remove what a session published and put the normal PXE menu back. Used at the end of a session and by `--stop`.
+fn end_multicast(c: &Config) {
+    for f in [CLIENT_CONF, CLIENT_PSEUDO] {
+        let _ = fs::remove_file(Path::new(&c.web_root).join(f));
+    }
+    let _ = fs::remove_file(MCAST_LOCK);
+    if let Err(e) = write_grub(c, Ctx { dry: false }) {
+        warn(&format!("could not write the normal PXE menu back: {e} (run: sudo pxe-ctl grub)"));
+    }
+}
+
+/// Cleans up when the session ends (also on an error).
+struct McastSession(Config);
+impl Drop for McastSession {
+    fn drop(&mut self) {
+        end_multicast(&self.0);
+    }
+}
+
+/// `ctl multicast --clients N [--wait SECS] [--image NAME]` | `--stop` - send IMAGE_NAME to N targets at once.
+///
+/// It publishes the two client files in the web root, makes the multicast entry the default of the PXE menu (so every
+/// target that PXE boots joins by itself), then sends each partition with `udp-sender` as soon as N targets have
+/// connected (the first partition waits at most SECS seconds for them). Run it in a terminal and leave it open: it
+/// shows the progress, and at the end it removes the files and writes the normal PXE menu back. If it was killed,
+/// `--stop` does the clean-up. The targets ERASE their disk TARGET_DISK. Hosts that already have a done marker
+/// skip PXE (`pxe-ctl reinstall <mac>` removes it).
+fn multicast(mut c: Config, args: &[String]) -> Result<(), String> {
+    let a = parse_multicast_args(args)?;
+    if a.stop {
+        end_multicast(&c);
+        println!("multicast session cleaned up: client files removed, normal PXE menu written");
+        return Ok(());
+    }
+    if let Some(name) = a.image {
+        c.image_name = name;
+    }
+    let clients = a.clients.ok_or("--clients N is required: how many targets to wait for, e.g.: pxe-ctl multicast --clients 2")?;
+    if !is_image_name(&c.image_name) || !is_disk_name(&c.target_disk) {
+        return Err("IMAGE_NAME or TARGET_DISK is not valid".into());
+    }
+    let image_dir = Path::new(&c.image_dir).join(&c.image_name);
+    if !image_dir.is_dir() {
+        return Err(format!("image {} not found", image_dir.display()));
+    }
+    let parts = multicast_parts(&image_dir)?;
+    if !probe("sh", &["-c", "command -v udp-sender >/dev/null"]) {
+        return Err("udp-sender not found: install it with `sudo apt install udpcast`".into());
+    }
+    if let Ok(pid) = fs::read_to_string(MCAST_LOCK) {
+        let pid = pid.trim();
+        if !pid.is_empty() && Path::new(&format!("/proc/{pid}")).exists() {
+            return Err(format!("another multicast session is running (pid {pid})"));
+        }
+    }
+    fs::write(MCAST_LOCK, format!("{}\n", std::process::id())).map_err(|e| format!("write {MCAST_LOCK}: {e}"))?;
+    let _session = McastSession(c.clone()); // from here on, whatever happens, the clean-up runs at the end
+
+    fs::create_dir_all(&c.web_root).map_err(|e| format!("mkdir {}: {e}", c.web_root))?;
+    pack_pseudo_image(&image_dir, &Path::new(&c.web_root).join(CLIENT_PSEUDO))?;
+    let conf = Path::new(&c.web_root).join(CLIENT_CONF);
+    fs::write(&conf, client_run_conf(&c.image_name, &c.target_disk)).map_err(|e| format!("write {}: {e}", conf.display()))?;
+    let ctx = Ctx { dry: false };
+    write_file(ctx, &format!("{}/grub/grub.cfg", c.tftp_root), &render::grub_cfg_multicast(&c), 0o644, false)?;
+    fix_perms(&c, ctx)?;
+
+    println!(
+        "Multicast restore of image {} onto /dev/{} of every target that joins (the disk is ERASED).\n\
+         The PXE menu now starts the multicast entry by itself: PXE boot the targets in UEFI mode. A target that was\n\
+         already restored has a done marker and skips PXE: sudo pxe-ctl reinstall <mac>.\n\
+         Waiting for {clients} target(s) (the first partition waits at most {} s); {} partition(s) to send on {}.\n\
+         Leave this window open; Ctrl+C stops the session (then run: sudo pxe-ctl multicast --stop).",
+        c.image_name,
+        c.target_disk,
+        a.wait,
+        parts.len(),
+        c.iface
+    );
+    for (n, (part, files)) in parts.iter().enumerate() {
+        let n = n as u32;
+        println!("\n=== partition {part} ({}/{}) on UDP port {} ===", n + 1, parts.len(), MCAST_PORT + 2 * n);
+        let mut cat = std::process::Command::new("cat")
+            .args(files.iter())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run cat: {e}"))?;
+        let feed = cat.stdout.take().ok_or("no pipe from cat")?;
+        let sent = std::process::Command::new("udp-sender")
+            .args(udp_sender_args(&c.iface, clients, a.wait, n))
+            .stdin(std::process::Stdio::from(feed))
+            .status()
+            .map_err(|e| format!("cannot run udp-sender: {e}"));
+        let _ = cat.wait();
+        let sent = sent?;
+        if !sent.success() {
+            return Err(format!("udp-sender failed for {part} ({sent}); the session is cancelled"));
+        }
+    }
+    println!(
+        "\nAll {} partition(s) were sent. The targets now finish by themselves (bootloader, resize, hostname/IP,\n\
+         done marker) and reboot. Check with: sudo pxe-ctl status | times",
+        parts.len()
+    );
+    Ok(())
+}
+
 /// `pxe-installer ctl <subcommand> ...`
 pub fn ctl(args: &[String]) -> Result<(), String> {
     let c = Config::load_runtime();
@@ -643,6 +918,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
         }
         Some("mode") => switch_mode(c, args.get(1).map(|s| s.as_str())),
         Some("clone") => clone_image(c, &args[1..]),
+        Some("multicast") => multicast(c, &args[1..]),
         Some("binds") => {
             for l in read_hosts(&c) {
                 println!("{l}");
@@ -656,7 +932,7 @@ pub fn ctl(args: &[String]) -> Result<(), String> {
             bind(&c, &mac, ip, name, true)
         }
         Some("unbind") => unbind(&c, args.get(1).ok_or("MAC or IP required")?),
-        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force] | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
+        _ => Err("usage: pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force] | multicast --clients N [--wait SECS] [--image NAME] | multicast --stop | reinstall <mac> | done <mac> | binds | bind <mac> <ip> [name] | unbind <mac|ip>".into()),
     }
 }
 
@@ -824,6 +1100,98 @@ mod tests {
             ]
         );
         assert!(parse_leases("").is_empty());
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn multicast_args() {
+        assert_eq!(
+            parse_multicast_args(&strs(&["--clients", "100"])).unwrap(),
+            McastArgs { clients: Some(100), wait: 600, image: None, stop: false }
+        );
+        assert_eq!(
+            parse_multicast_args(&strs(&["--clients", "2", "--wait", "90", "--image", "golden-2"])).unwrap(),
+            McastArgs { clients: Some(2), wait: 90, image: Some("golden-2".to_string()), stop: false }
+        );
+        assert!(parse_multicast_args(&strs(&["--stop"])).unwrap().stop);
+        for bad in [
+            vec!["--clients"],
+            vec!["--clients", "0"],
+            vec!["--clients", "many"],
+            vec!["--wait", "-1"],
+            vec!["--image", "../x"],
+            vec!["--bogus"],
+        ] {
+            assert!(parse_multicast_args(&strs(&bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn multicast_sender_options_follow_clonezilla() {
+        // first partition: waits for the clients, base port; later ones: short wait, port + 2 each
+        let first = udp_sender_args("enp0s31f6", 100, 600, 0).join(" ");
+        assert_eq!(
+            first,
+            "--min-clients 100 --max-wait 600 --interface enp0s31f6 --nokbd --mcast-all-addr 224.0.0.1 --portbase 2232 --ttl 1"
+        );
+        let third = udp_sender_args("enp0s31f6", 100, 600, 2).join(" ");
+        assert!(third.contains("--max-wait 30 ") && third.contains("--portbase 2236 "), "{third}");
+    }
+
+    #[test]
+    fn multicast_client_conf() {
+        let c = client_run_conf("cri-golden", "nvme0n1");
+        assert_eq!(
+            c,
+            "pseudo_img=\"img-wo-fs.tar.xz\"\nimg_prefix=\"cri-golden\"\n\
+             ocs_sr_opt=\"--ocsroot /tmp/ -l en_US.UTF-8 --batch -g auto -e1 auto -e2 -r -j2 -k0 -p true -scr --mcast-port 2232 multicast_restoredisk\"\n\
+             ocs_restore_dev=\"nvme0n1\"\n"
+        );
+    }
+
+    #[test]
+    fn multicast_parts_in_image_order() {
+        let dir = std::env::temp_dir().join(format!("pxe-mc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("parts"), "sda1 sda2 sda10\n").unwrap();
+        for f in [
+            "sda1.ext4-ptcl-img.zst",
+            "sda2.vfat-ptcl-img.zst.ab", // split image: the parts are sent in order
+            "sda2.vfat-ptcl-img.zst.aa",
+            "sda10.ntfs-ptcl-img.zst", // sda1 must not match "sda10"
+            "sda1-pt.sf",
+            "disk",
+        ] {
+            fs::write(dir.join(f), "x").unwrap();
+        }
+        let p = multicast_parts(&dir).unwrap();
+        let names: Vec<(String, Vec<String>)> = p
+            .iter()
+            .map(|(n, f)| (n.clone(), f.iter().map(|x| x.file_name().unwrap().to_string_lossy().to_string()).collect()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("sda1".to_string(), strs(&["sda1.ext4-ptcl-img.zst"])),
+                ("sda2".to_string(), strs(&["sda2.vfat-ptcl-img.zst.aa", "sda2.vfat-ptcl-img.zst.ab"])),
+                ("sda10".to_string(), strs(&["sda10.ntfs-ptcl-img.zst"])),
+            ]
+        );
+        // what is sent over multicast is a data file; the small files travel in the metadata tarball
+        assert!(is_image_data_file("sda1.ext4-ptcl-img.zst") && is_image_data_file("sda2.vfat-ptcl-img.zst.aa"));
+        assert!(!is_image_data_file("sda1-pt.sf") && !is_image_data_file("parts") && !is_image_data_file("disk"));
+
+        // a partition without a partclone file, and an LVM image, are refused (never sent half)
+        fs::write(dir.join("parts"), "sda1 sda3\n").unwrap();
+        assert!(multicast_parts(&dir).unwrap_err().contains("sda3"));
+        fs::write(dir.join("parts"), "sda1\n").unwrap();
+        fs::write(dir.join("lvm_logv.list"), "x").unwrap();
+        assert!(multicast_parts(&dir).unwrap_err().contains("LVM"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

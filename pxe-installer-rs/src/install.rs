@@ -14,8 +14,8 @@ use crate::util::*;
 
 /// dnsmasq (DHCP + TFTP), apache2 and nfs-kernel-server are the PXE services; curl is used by the checks and
 /// unzip unpacks the Clonezilla Live zip; clonezilla/partclone/pigz/zstd let this host capture the golden image
-/// (`ocs-sr`).
-const PACKAGES: [&str; 9] = [
+/// (`ocs-sr`); udpcast is the `udp-sender` of `pxe-ctl multicast`.
+const PACKAGES: [&str; 10] = [
     "dnsmasq",
     "apache2",
     "curl",
@@ -25,6 +25,7 @@ const PACKAGES: [&str; 9] = [
     "pigz",
     "zstd",
     "unzip",
+    "udpcast",
 ];
 
 /// DHCP, TFTP and HTTP: the services a target needs to PXE boot (NFS is separate: it only serves images).

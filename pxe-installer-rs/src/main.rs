@@ -14,10 +14,12 @@ USAGE
                                                                  the netboot / Clonezilla Live files YOU copy by hand and where
   pxe-installer start   [--config FILE] [--dry-run] [options]   configure network/DHCP/PXE menu/NFS, start the services
   pxe-installer ctl list | status | times | stop | grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force]
+                    | multicast --clients N [--wait SECS] [--image NAME] | multicast --stop
                     | reinstall <mac> | done <mac>
                     | binds | bind <mac> <ip> [name] | unbind <mac|ip>
                     (clone = interactive fsck of each partition, then ocs-sr, on this terminal;
-                     --yes = no prompts, --force = replace an existing image)
+                     --yes = no prompts, --force = replace an existing image;
+                     multicast = send the image once to N targets at the same time, run it in a terminal)
   pxe-installer print-config            show the default config file
   pxe-installer cgi-done | cgi-seed     (internal) Apache callbacks
 

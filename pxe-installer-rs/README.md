@@ -32,7 +32,7 @@ Outputs: `target/x86_64-unknown-linux-musl/release/pxe-installer` (static CLI) a
 
 ## What `install` does, and the files it unpacks
 `install` installs the packages (dnsmasq, apache2, nfs-kernel-server, curl, unzip and the Clonezilla tools
-`clonezilla partclone pigz zstd`), creates the directories and leaves the services stopped. **It downloads nothing.** As its **last step** it unpacks the two files you put on the server beforehand:
+`clonezilla partclone pigz zstd udpcast`), creates the directories and leaves the services stopped. **It downloads nothing.** As its **last step** it unpacks the two files you put on the server beforehand:
 
 | Put it in (setting) | `install` then does |
 | --- | --- |
@@ -150,6 +150,7 @@ sudo pxe-ctl times                           # deploy time of every MAC (all run
 sudo pxe-ctl list | reinstall <mac> | done <mac>
 sudo pxe-ctl binds | bind <mac> <ip> [name] | unbind <mac|ip>
 sudo pxe-ctl grub | import | nfs | mode [tmpfs|nfs] | clone <disk> [--image NAME] [--yes] [--force] | stop
+sudo pxe-ctl multicast --clients N [--wait SECS] [--image NAME] | multicast --stop   # one stream for all targets
   # bindings are stored as `dhcp-host=mac,ip,name` lines in /etc/dnsmasq.d/pxe-hosts.conf (loaded via the global conf-dir);
   # bind/unbind restart dnsmasq because dhcp-host lines are not re-read on SIGHUP
 ```
@@ -210,6 +211,39 @@ Coming from the Kea + tftpd-hpa build: run **Install** and **Start** again. `sta
 tftpd-hpa (only when their config is the one this tool generated; the packages and files stay), and takes over
 the MAC bindings of that build (`/etc/pxe-installer-hosts.conf` or `/etc/kea/pxe-hosts.conf`), rewriting them with
 the `dhcp-host=` prefix dnsmasq needs. Do not run another DHCP or TFTP server on the same network.
+
+## Multicast restore (one stream for all targets)
+Normally every target pulls its own copy of the image over NFS, so the server sends 100 copies to 100 targets.
+`pxe-ctl multicast` (Manage tab: **Multicast restore**) sends the image **once** to all targets at the same time,
+using Clonezilla's own multicast pieces, so the whole rollout takes about *image size / speed of the slowest
+target*, whatever the number of targets. It does not replace the NFS restore: both stay available.
+
+```
+sudo pxe-ctl multicast --clients 100 [--wait 600] [--image NAME]    # run it in a terminal and leave it open
+sudo pxe-ctl multicast --stop                                      # clean up after an interrupted session
+```
+What happens:
+1. It publishes two files in the web root (`/var/www/html`): `ocs-client-run.conf` and `img-wo-fs.tar.xz` (the image
+   folder without the data files). They are what Clonezilla's client script `ocs-live-get-img` downloads.
+2. It makes the **Multicast restore** entry the default of the PXE menu (`set default=2`), so every target that PXE
+   boots joins by itself; the normal menu is written back when the session ends.
+3. When `--clients` targets have connected (the first partition waits at most `--wait` seconds), it sends each
+   partition of the image with `udp-sender`, one after the other, in the order of the image's `parts` file, on UDP
+   port 2232, 2234, ... (+2 per partition), multicast group 224.0.0.1, TTL 1 (the same values as Clonezilla).
+4. Each target restores with `ocs-sr ... multicast_restoredisk` (partition table, partitions, GRUB, resize), then runs
+   the usual `post.sh` (hostname, IP from the binding, done marker, deploy time) and reboots.
+
+Requirements and limits:
+- Package `udpcast` (installed by **Install**); the Clonezilla Live system of the targets already has the receiver.
+- The switch needs IGMP snooping with a querier, or multicast floods every port of that switch.
+- Partclone images only (`*-ptcl-img.*`), **no LVM** images; others are refused.
+- The target disk of every target that joins is ERASED. A host that already has a done marker skips PXE
+  (`pxe-ctl reinstall <mac>`). `TARGET_DISK` must exist on all targets.
+- The clients also report "done" to Clonezilla's `ocsmgrd`, which is not started here; the targets may wait a short
+  while for it at the end, the data transfer is not affected. Our own `pxe-done` records the result.
+- `pxe-ctl multicast` does **not** use Clonezilla's `ocs-live-feed-img`: that script stops dnsmasq and rewrites the
+  PXE configuration.
+- Test with 2 targets first (`--clients 2`) before the full run.
 
 ## Security
 PXE, TFTP, NFS and the callbacks are unauthenticated: use an isolated provisioning network with no other

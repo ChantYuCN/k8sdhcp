@@ -710,6 +710,37 @@ fn manage_tab() -> gtk::Widget {
             dialog.present();
         });
     }
+    // Multicast restore: the image of the running server is sent ONCE to all targets at the same time.
+    let mc_clients = entry("");
+    mc_clients.set_placeholder_text(Some("number of targets to wait for, e.g. 100"));
+    let mc_btn = gtk::Button::with_label("Multicast restore");
+    mc_btn.add_css_class("destructive-action");
+    mc_btn.set_tooltip_text(Some(
+        "Opens a terminal window that sends the image (the one in use since Start) once to all targets over multicast. \
+         While it runs, the PXE menu starts the multicast entry by itself: PXE boot the targets in UEFI mode. \
+         It starts sending as soon as that many targets have joined, shows the progress, and at the end writes the \
+         normal PXE menu back. The target disk of every target that joins is ERASED.",
+    ));
+    let mc_stop = gtk::Button::with_label("Clean up multicast");
+    mc_stop.set_tooltip_text(Some("After an interrupted session: removes the client files and writes the normal PXE menu back"));
+    {
+        let (log, mc_clients) = (log.clone(), mc_clients.clone());
+        mc_btn.connect_clicked(move |_| match text_of(&mc_clients).trim().parse::<u32>() {
+            Ok(n) if n >= 1 => {
+                run_ctl_terminal(vec!["multicast".to_string(), "--clients".to_string(), n.to_string()], &log)
+            }
+            _ => append(&log, "Enter how many targets to wait for (a number, 1 or more).\n"),
+        });
+    }
+    {
+        let log = log.clone();
+        mc_stop.connect_clicked(move |_| run_ctl(vec!["multicast".to_string(), "--stop".to_string()], &log));
+    }
+    let mc_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    mc_row.append(&mc_clients);
+    mc_row.append(&mc_btn);
+    mc_row.append(&mc_stop);
+
     let clone_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     clone_row.append(&clone_disk);
     clone_row.append(&clone_name);
@@ -720,6 +751,7 @@ fn manage_tab() -> gtk::Widget {
     outer.append(&top);
     outer.append(&framed("Per-host actions", &inner));
     outer.append(&framed("Clone image (capture a disk of this server for the targets)", &clone_row));
+    outer.append(&framed("Multicast restore (one stream for all targets, instead of one copy per target)", &mc_row));
     outer.append(&log_sw);
     outer.upcast()
 }

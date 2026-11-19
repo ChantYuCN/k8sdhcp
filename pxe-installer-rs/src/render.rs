@@ -82,6 +82,11 @@ menuentry "Restore @IMAGE_NAME@ to /dev/@TARGET_DISK@ (ERASES THE DISK)" {
     linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts=us locales=en_US.UTF-8 @ROOT_ARGS@ ocs_prerun=\"mount -t nfs -o ro,vers=3,tcp,rsize=1048576 @SERVER_IP@:@IMAGE_DIR@ /home/partimag\" ocs_prerun1=\"wget -q -T 5 -t 2 -O /dev/null http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/start\" ocs_live_run=\"ocs-sr -g auto -e1 auto -e2 -batch -r -j2 -scr -p true restoredisk @IMAGE_NAME@ @TARGET_DISK@\" ocs_live_extra_param=\"\" ocs_live_keymap=\"NONE\" ocs_lang=\"en_US.UTF-8\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
     initrd /clonezilla/initrd.img
 }
+menuentry "Multicast restore @IMAGE_NAME@ to /dev/@TARGET_DISK@ (ERASES THE DISK, joins a running pxe-ctl multicast session)" {
+    echo "Loading Clonezilla Live (multicast)..."
+    linux /clonezilla/vmlinuz boot=live union=overlay username=user config noswap nomodeset noprompt net.ifnames=0 keyboard-layouts=us locales=en_US.UTF-8 @ROOT_ARGS@ ocs_prerun=\"wget -q -T 5 -t 2 -O /dev/null http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/start\" ocs_live_run=\"ocs-live-get-img @SERVER_IP@\" ocs_live_extra_param=\"\" ocs_live_keymap=\"NONE\" ocs_lang=\"en_US.UTF-8\" ocs_live_batch=\"yes\" ocs_postrun1=\"wget -q -O /tmp/post.sh http://@SERVER_IP@/cgi-bin/pxe-seed/${net_default_mac}/post.sh\" ocs_postrun2=\"sh /tmp/post.sh\" ocs_postrun3=\"reboot\" ---
+    initrd /clonezilla/initrd.img
+}
 menuentry "Boot from local disk" {
     exit
 }
@@ -200,8 +205,17 @@ pub fn dnsmasq_conf(c: &Config) -> String {
 }
 
 pub fn grub_cfg(c: &Config) -> String {
-    // entries: 0 = interactive Clonezilla, 1 = restore the image, 2 = local disk
-    let default = if c.auto_install { "1" } else { "0" };
+    // entries: 0 = interactive Clonezilla, 1 = restore the image over NFS, 2 = multicast restore, 3 = local disk
+    grub_menu(c, if c.auto_install { "1" } else { "0" })
+}
+
+/// The menu while a multicast session runs (`pxe-ctl multicast`): the multicast entry is the default, so every
+/// target that PXE boots joins the session by itself. `pxe-ctl multicast` writes the normal menu again at its end.
+pub fn grub_cfg_multicast(c: &Config) -> String {
+    grub_menu(c, "2")
+}
+
+fn grub_menu(c: &Config, default: &str) -> String {
     let root_args = match c.root_mode {
         RootMode::Tmpfs => format!("fetch=http://{}/clonezilla/filesystem.squashfs", c.server_ip),
         RootMode::Nfs => format!("netboot=nfs nfsroot={}:{}", c.server_ip, c.live_root),
@@ -313,7 +327,7 @@ mod tests {
         assert!(s.contains("http://192.168.5.1/cgi-bin/pxe-seed/${net_default_mac}/post.sh"));
         assert!(s.contains(r#"ocs_postrun2=\"sh /tmp/post.sh\""#));
         // the restore entry (only) tells the server when the deploy starts: elapsed time = done - start
-        assert_eq!(s.matches("/cgi-bin/pxe-seed/${net_default_mac}/start").count(), 1);
+        assert_eq!(s.matches("/cgi-bin/pxe-seed/${net_default_mac}/start").count(), 2); // restore + multicast entry
         assert!(s.contains(r#"ocs_postrun3=\"reboot\""#));
         // the restore entry is hands-free: no keyboard/language question, batch mode, no confirmation
         let restore = s.lines().find(|l| l.contains("restoredisk")).unwrap();
@@ -340,10 +354,35 @@ mod tests {
     }
 
     #[test]
+    fn grub_multicast_entry_and_default() {
+        let s = grub_cfg(&cfg());
+        let entry = s.lines().find(|l| l.contains("ocs-live-get-img")).expect("multicast entry");
+        // the client script of Clonezilla: it fetches ocs-client-run.conf + img-wo-fs.tar.xz from the server and joins
+        assert!(entry.contains(r#"ocs_live_run=\"ocs-live-get-img 192.168.5.1\""#), "{entry}");
+        // unattended: batch, explicit language and keyboard, no NFS mount needed (the metadata comes over HTTP)
+        for p in [r#"ocs_live_batch=\"yes\""#, " keyboard-layouts=us ", " locales=en_US.UTF-8 "] {
+            assert!(entry.contains(p), "{p} missing: {entry}");
+        }
+        assert!(!entry.contains("mount -t nfs"));
+        // same per-MAC follow-up as the unicast restore: deploy start, post.sh (hostname, IP, done marker), reboot
+        assert!(entry.contains("pxe-seed/${net_default_mac}/start") && entry.contains("pxe-seed/${net_default_mac}/post.sh"));
+        assert!(entry.contains(r#"ocs_postrun2=\"sh /tmp/post.sh\""#) && entry.contains(r#"ocs_postrun3=\"reboot\""#));
+        // the normal menu keeps restoring over NFS; during a multicast session the multicast entry is the default
+        assert!(s.contains("set default=1"));
+        let m = grub_cfg_multicast(&cfg());
+        assert!(m.contains("set default=2") && !m.contains("set default=1"));
+        // entry 2 really is the multicast one (0 = interactive, 1 = NFS restore, 2 = multicast, 3 = local disk)
+        let titles: Vec<&str> = m.lines().filter(|l| l.starts_with("menuentry")).collect();
+        assert_eq!(titles.len(), 4);
+        assert!(titles[2].contains("Multicast restore cri-golden") && titles[3].contains("local disk"));
+        assert!(!m.contains('@'));
+    }
+
+    #[test]
     fn grub_root_mode_tmpfs_or_nfs() {
         // default: the live system is downloaded into RAM
         let s = grub_cfg(&cfg());
-        assert_eq!(s.matches("fetch=http://192.168.5.1/clonezilla/filesystem.squashfs").count(), 2);
+        assert_eq!(s.matches("fetch=http://192.168.5.1/clonezilla/filesystem.squashfs").count(), 3);
         assert!(!s.contains("netboot=nfs") && !s.contains("nfsroot="));
 
         // NFS root: both entries mount the extracted Clonezilla Live folder, nothing is downloaded
@@ -351,7 +390,7 @@ mod tests {
         c.root_mode = RootMode::Nfs;
         c.live_root = "/srv/nfs/clonezilla".into();
         let s = grub_cfg(&c);
-        assert_eq!(s.matches("netboot=nfs nfsroot=192.168.5.1:/srv/nfs/clonezilla ").count(), 2);
+        assert_eq!(s.matches("netboot=nfs nfsroot=192.168.5.1:/srv/nfs/clonezilla ").count(), 3);
         assert!(!s.contains("fetch="));
         // the image repository is still mounted, and the rest of the entries is unchanged
         assert!(s.contains("192.168.5.1:/home/partimag /home/partimag"));
